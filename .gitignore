@@ -1,0 +1,26 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Gradle / Kotlin / Android
+.gradle/
+.kotlin/
+build/
+*/build/
+*/*/build/
+local.properties
+captures/
+.cxx/
+*.iml
+.idea/
+
+# Xcode / iOS
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+Pods/
+*.xcworkspace
+
+# OS
+.DS_Store

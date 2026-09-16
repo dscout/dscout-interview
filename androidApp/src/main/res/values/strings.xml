@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  10.0.2.2 is the Android emulator's alias for the host machine's localhost;
+  the emulator can't reach the host as `localhost`. A physical device instead
+  needs the host's LAN IP address here (and a matching entry in
+  res/xml/network_security_config.xml).
+-->
+<resources>
+    <string name="backend_base_url">http://10.0.2.2:4000</string>
+</resources>

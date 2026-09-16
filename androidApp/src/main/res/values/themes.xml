@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Compose UI in `shared` is the entire screen; a system ActionBar has
+  no content to show and, worse, overlaps the top of the Compose content
+  view instead of reserving space above it (Compose isn't ActionBar-aware).
+  NoActionBar avoids that overlap entirely.
+-->
+<resources>
+    <style name="Theme.SurveyApp" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
