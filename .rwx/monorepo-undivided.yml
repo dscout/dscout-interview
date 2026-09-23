@@ -1,0 +1,71 @@
+# Starter workflow: every revision runs CI and then a simulated deployment.
+#
+# The monorepo contains three apps: zorch, greeb, and blerg. blerg depends on
+# greeb, so a greeb source change invalidates both greeb and blerg builds. A
+# zorch-only change leaves those builds cacheable. The sleeps make cache misses
+# observably slower without building real applications or deploying anything.
+#
+# This workflow is intentionally undivided: its capacity-one queue covers the
+# full CI-and-deploy run. The test driver creates real local Git commits and
+# `rwx run` patches each revision into the clone; nothing is pushed.
+
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.1.1
+
+concurrency-pools:
+  - id: dscout-interview/devops-challenge/monorepo-undivided
+    capacity: 1
+    on-overflow: queue
+
+tasks:
+  - key: code
+    call: git/clone 2.1.0
+    with:
+      repository: https://github.com/dscout/dscout-interview.git
+      ref: ${{ init.commit-sha }}
+
+  - key: build-zorch
+    use: code
+    filter:
+      - source/zorch.txt
+    run: |
+      echo "Building app zorch from $(cat source/zorch.txt)"
+      sleep 3
+      echo "zorch build complete"
+
+  - key: build-greeb
+    use: code
+    filter:
+      - source/greeb.txt
+    run: |
+      echo "Building app greeb from $(cat source/greeb.txt)"
+      sleep 6
+      echo "greeb build complete"
+
+  - key: build-blerg
+    use: code
+    filter:
+      - source/greeb.txt
+      - source/blerg.txt
+    after: build-greeb
+    run: |
+      echo "Building app blerg from greeb=$(cat source/greeb.txt), blerg=$(cat source/blerg.txt)"
+      sleep 6
+      echo "blerg build complete"
+
+  - key: deploy
+    after: [build-zorch, build-greeb, build-blerg]
+    cache: false
+    run: |
+      echo "[$REVISION] deploying simulated release"
+      sleep 2
+      printf '%s\n' "$REVISION" > deployed-revision.txt
+      echo "DEPLOYED_REVISION=$REVISION"
+    env:
+      REVISION: ${{ init.revision }}
