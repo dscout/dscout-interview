@@ -21,6 +21,10 @@ cleanup() {
 trap cleanup EXIT
 
 nonce="smoke-$(date +%s)-$RANDOM"
+REPOSITORY="${RWX_CHALLENGE_REPOSITORY:-$(git -C "$ROOT" remote get-url origin)}"
+case "$REPOSITORY" in
+  git@github.com:*) REPOSITORY="https://github.com/${REPOSITORY#git@github.com:}" ;;
+esac
 create_commit_worktrees "$ROOT" "$workdir" "$nonce"
 
 for tree in "$GREEB_WORKTREE" "$ZORCH_WORKTREE"; do
@@ -32,7 +36,7 @@ start_run() {
   local tree="$1" revision="$2" result_var="$3" output
   output="$(cd "$tree" && rwx run .rwx/monorepo-undivided.yml \
     --title "monorepo fixture ${revision:0:12}" \
-    --init "revision=$revision" --json)"
+    --init "revision=$revision" --init "repository=$REPOSITORY" --json)"
   local id
   id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["RunID"])' <<<"$output")"
   printf -v "$result_var" '%s' "$id"

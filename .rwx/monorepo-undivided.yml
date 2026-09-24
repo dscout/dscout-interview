@@ -27,7 +27,7 @@ tasks:
   - key: code
     call: git/clone 2.1.0
     with:
-      repository: https://github.com/dscout/dscout-interview.git
+      repository: ${{ init.repository }}
       ref: ${{ init.commit-sha }}
 
   - key: build-zorch

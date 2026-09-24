@@ -21,6 +21,10 @@ cleanup() {
 trap cleanup EXIT
 
 nonce="challenge-$(date +%s)-$RANDOM"
+REPOSITORY="${RWX_CHALLENGE_REPOSITORY:-$(git -C "$ROOT" remote get-url origin)}"
+case "$REPOSITORY" in
+  git@github.com:*) REPOSITORY="https://github.com/${REPOSITORY#git@github.com:}" ;;
+esac
 create_commit_worktrees "$ROOT" "$workdir" "$nonce"
 
 # The workflow is being developed locally and may not yet be committed. Copy
@@ -37,7 +41,8 @@ start_revision() {
   echo "Starting $revision from real commit $revision"
   output="$(cd "$tree" && rwx run .rwx/monorepo-undivided.yml \
     --title "$(git -C "$tree" log -1 --format=%s)" \
-    --init "revision=$revision" 2>&1)" || {
+    --init "revision=$revision" \
+    --init "repository=$REPOSITORY" 2>&1)" || {
       printf '%s\n' "$output" >&2
       return 1
     }

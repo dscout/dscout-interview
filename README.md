@@ -30,21 +30,38 @@ Bash:
 bash test/cases/commit-sequence.sh
 ```
 
-To start the simulated sequence on RWX, sign in to the RWX CLI and run:
+## Run it with RWX
+
+You can use RWX from your own account; access to dscout's RWX organization is
+not required. Create an RWX Cloud account, create or select an organization,
+install the CLI, and authenticate:
+
+```sh
+brew install rwx-cloud/tap/rwx
+rwx login
+rwx whoami
+```
+
+Fork this repository to your GitHub account and run the exercise from your
+fork's checkout. A public fork is the simplest setup: RWX must be able to clone
+the commit being tested. Private forks need additional GitHub integration and
+clone authentication configuration that is not included in this starter.
+
+To start the simulated sequence, run:
 
 ```sh
 ./simulate-commit-sequence.sh
 ```
 
-This creates disposable local Git worktrees with two successive commits: the
-first changes `greeb`; the next changes only `zorch`. It starts an RWX CLI run
-from each worktree without pushing. RWX applies each worktree's local changes
-to its clone for the run. RWX runs use real resources, so this command starts
-billable work. You can inspect the runs in RWX after they start.
+The script creates disposable local Git worktrees with two successive commits:
+the first changes `greeb`; the next changes only `zorch`. It starts an RWX CLI
+run from each worktree without pushing. The workflow clones your fork at each
+commit. RWX runs use real compute and cache resources; check current RWX pricing
+and any free credits before running. You can inspect results in your own RWX
+organization.
 
 The optional baseline smoke test waits for both runs and checks that the
-unchanged builds cache-hit in the starter workflow. It also requires an
-authenticated RWX CLI and uses RWX resources:
+unchanged builds cache-hit in the starter workflow. It uses RWX resources:
 
 ```sh
 ./test/rwx-smoke.sh
