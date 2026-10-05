@@ -1,17 +1,13 @@
-"""Candidate-editable orchestration."""
+"""Candidate-editable pipeline definition."""
 
-from simulation import APPS
+from workflow import Build, Deploy, Pipeline
 
-
-def run_revision(sim, revision):
-    revision = sim.resolve(revision)
-    artifacts = {}
-    for app in APPS:
-        artifacts[app] = sim.build(revision, app, artifacts.get("greeb"))
-    sim.deploy(revision, artifacts)
-
-
-def run(sim, revisions):
-    with sim.lock("pipeline"):
-        for revision in revisions:
-            run_revision(sim, revision)
+pipeline = Pipeline(
+    pool="pipeline",
+    tasks=[
+        Build("zorch"),
+        Build("greeb"),
+        Build("blerg", needs=["greeb"]),
+        Deploy("release", needs=["zorch", "greeb", "blerg"]),
+    ],
+)

@@ -130,12 +130,11 @@ class Simulation:
         for app in APPS:
             self.validate_artifact(revision, app, artifacts[app])
         self.event("deploy_requested", revision)
-        with self.lock("release"):
-            self.event("deploy_started", revision)
-            time.sleep(0.2 * self.speed)
-            write_json(self.state / "release.json",
-                       {"revision": revision, "artifacts": artifacts})
-            self.event("deploy_finished", revision)
+        self.event("deploy_started", revision)
+        time.sleep(0.2 * self.speed)
+        write_json(self.state / "release.json",
+                   {"revision": revision, "artifacts": artifacts})
+        self.event("deploy_finished", revision)
 
     def events(self):
         with self.lock("events"):

@@ -1,3 +1,6 @@
+import builtins
+from contextlib import redirect_stdout, redirect_stderr
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -5,17 +8,33 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
+import exercise
 from fixture import create_history, git
-from pipeline import run, run_revision
+from workflow import Build, Deploy, Pipeline, execute_pipeline
 from simulation import APPS, Simulation
 
 ROOT = Path(__file__).resolve().parents[1]
 
+starter_pipeline = Pipeline(
+    pool="pipeline",
+    tasks=[
+        Build("zorch"),
+        Build("greeb"),
+        Build("blerg", needs=["greeb"]),
+        Deploy("release", needs=["zorch", "greeb", "blerg"]),
+    ],
+)
+
 
 class ExerciseTests(unittest.TestCase):
     def setUp(self):
+        pipeline_patch = patch("exercise.pipeline", starter_pipeline)
+        pipeline_patch.start()
+        self.addCleanup(pipeline_patch.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
@@ -38,7 +57,7 @@ class ExerciseTests(unittest.TestCase):
         # Finish each run before asserting that its published entries are reusable.
         expected_hits = (set(), {"zorch"}, {"greeb", "blerg"})
         for revision, hits in zip(self.revisions, expected_hits):
-            run(self.sim, [revision])
+            execute_pipeline(self.sim, starter_pipeline, [revision])
             events = [e for e in self.sim.events()
                       if e["revision"] == revision and e["kind"] == "build_finished"]
             self.assertEqual({e["app"] for e in events}, set(APPS))
@@ -52,7 +71,7 @@ class ExerciseTests(unittest.TestCase):
                             self.sim.cache_key(greeb, "blerg"))
         self.assertEqual(self.sim.cache_key(greeb, "blerg"),
                          self.sim.cache_key(zorch, "blerg"))
-        run(self.sim, self.revisions)
+        execute_pipeline(self.sim, starter_pipeline, self.revisions)
         builds = [e for e in self.sim.events() if e["kind"] == "build_finished"]
         self.assertTrue(all(e["cache_hit"] for e in builds[-9:]))
 
@@ -62,8 +81,8 @@ class ExerciseTests(unittest.TestCase):
         git(self.repo, "commit", "--quiet", "--allow-empty", "-m", "same source")
         other = git(self.repo, "rev-parse", "HEAD")
         self.assertNotEqual(base, other)
-        run_revision(self.sim, base)
-        run_revision(self.sim, other)
+        execute_pipeline(self.sim, starter_pipeline, [base])
+        execute_pipeline(self.sim, starter_pipeline, [other])
         hits = [e for e in self.sim.events()
                 if e["kind"] == "cache_hit" and e["revision"] == other]
         self.assertEqual({e["app"] for e in hits}, set(APPS))
@@ -79,17 +98,23 @@ class ExerciseTests(unittest.TestCase):
 
     def test_failed_build_does_not_publish_or_release(self):
         base, revision, _ = self.revisions
-        run_revision(self.sim, base)
+        execute_pipeline(self.sim, starter_pipeline, [base])
         release = (self.sim.state / "release.json").read_bytes()
         failing = Simulation(self.repo, self.sim.state, speed=0,
                              fail_build=lambda rev, app: app == "greeb")
         with self.assertRaises(RuntimeError):
-            run_revision(failing, revision)
+            execute_pipeline(failing, starter_pipeline, [revision])
         key = self.sim.cache_key(revision, "greeb")
         self.assertFalse((self.sim.state / "cache" / f"{key}.json").exists())
         self.assertFalse(self.sim.artifact_path(revision, "greeb").exists())
+        events = failing.events()
+        blocked = {event["task"] for event in events
+                   if event["revision"] == revision and event["kind"] == "task_blocked"}
+        self.assertEqual(blocked, {"blerg", "release"})
+        self.assertTrue(any(event["revision"] == revision and event["kind"] == "pipeline_failed"
+                            for event in events))
         self.assertEqual((self.sim.state / "release.json").read_bytes(), release)
-        run_revision(self.sim, revision)
+        execute_pipeline(self.sim, starter_pipeline, [revision])
         self.assertEqual(json.loads((self.sim.state / "release.json").read_text())
                          ["revision"], revision)
 
@@ -138,12 +163,44 @@ class ExerciseTests(unittest.TestCase):
         self.assertEqual(kinds.count("cache_hit"), 1)
         self.assertEqual(kinds.count("build_finished"), 2)
 
+    def test_execute_callbacks_suppress_output(self):
+        (self.root / "fixture.json").write_text(json.dumps({"revisions": self.revisions}))
+        events = []
+        ready = []
+
+        def on_ready(revisions):
+            self.assertEqual(revisions, self.revisions)
+            self.assertEqual(events, [])
+            ready.append(revisions)
+
+        def observe(event):
+            self.assertEqual(ready, [self.revisions])
+            events.append(event)
+
+        output = io.StringIO()
+        with redirect_stdout(output), patch("exercise.execute_pipeline",
+                                            wraps=execute_pipeline) as execute:
+            sim = exercise.execute(self.root, 0, observer=observe, on_ready=on_ready)
+        execute.assert_called_once_with(sim, starter_pipeline, self.revisions)
+        self.assertIsInstance(sim, Simulation)
+        self.assertEqual(sim.observer, observe)
+        self.assertCountEqual(events, sim.events())
+        self.assertTrue(events)
+        self.assertEqual(output.getvalue(), "")
+
     def test_cli_repeated_invocations(self):
         directory = self.root / "cli"
         command = [sys.executable, "-B", str(ROOT / "exercise.py"),
-                   "--directory", str(directory), "--speed", "0"]
+                   "--plain", "--directory", str(directory), "--speed", "0"]
         for _ in range(2):
-            subprocess.run(command, check=True, capture_output=True, cwd=self.root)
+            result = subprocess.run(command, check=True, capture_output=True,
+                                    text=True, cwd=self.root)
+            self.assertIn(f"Fixture: {directory.resolve()}", result.stdout)
+            self.assertIn("Revision: ", result.stdout)
+            self.assertIn("build_finished", result.stdout)
+            self.assertIn("pipeline_started", result.stdout)
+            self.assertIn("pipeline_finished", result.stdout)
+            self.assertIn(f"Release: {directory.resolve() / 'state/release.json'}", result.stdout)
         events = [json.loads(line) for line in
                   (directory / "state/events.jsonl").read_text().splitlines()]
         builds = [e for e in events if e["kind"] == "build_finished"]
@@ -153,6 +210,91 @@ class ExerciseTests(unittest.TestCase):
         sim = Simulation(directory / "repo", directory / "state", speed=0)
         for app in APPS:
             sim.validate_artifact(release["revision"], app, release["artifacts"][app])
+
+
+class DriverTests(unittest.TestCase):
+    def test_plain_does_not_import_ui(self):
+        original_import = builtins.__import__
+
+        def import_without_ui(name, *args, **kwargs):
+            if name == "tui" or name == "textual" or name.startswith("textual."):
+                self.fail(f"plain mode imported {name}")
+            return original_import(name, *args, **kwargs)
+
+        with patch("sys.argv", ["exercise.py", "--plain", "--speed", "0"]), \
+                patch("builtins.__import__", side_effect=import_without_ui), \
+                patch("exercise.execute") as execute:
+            exercise.main()
+        directory, speed = execute.call_args.args
+        self.assertEqual(speed, 0)
+        self.assertFalse(directory.exists())
+
+    def test_ui_temp_directory_lasts_until_app_closes(self):
+        directories = []
+
+        def run_app():
+            directory, speed = app_class.call_args.args
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(speed, 0)
+            directories.append(directory)
+
+        app = Mock(failed=False, return_code=0)
+        app.run.side_effect = run_app
+        app_class = Mock(return_value=app)
+        with patch.dict(sys.modules, {"tui": SimpleNamespace(BuildApp=app_class)}), \
+                patch("sys.argv", ["exercise.py", "--speed", "0"]):
+            exercise.main()
+        app.run.assert_called_once_with()
+        self.assertFalse(directories[0].exists())
+
+    def test_ui_failure_exits_nonzero_after_run(self):
+        for failed, return_code in ((True, 0), (False, 1)):
+            with self.subTest(failed=failed, return_code=return_code):
+                app = Mock(failed=failed, return_code=return_code)
+                with patch.dict(sys.modules, {"tui": SimpleNamespace(BuildApp=Mock(return_value=app))}), \
+                        patch("sys.argv", ["exercise.py"]), \
+                        self.assertRaises(SystemExit) as raised:
+                    exercise.main()
+                app.run.assert_called_once_with()
+                self.assertEqual(raised.exception.code, 1)
+
+    def test_missing_textual_has_install_guidance(self):
+        original_import = builtins.__import__
+
+        def missing_textual(name, *args, **kwargs):
+            if name == "tui":
+                raise ModuleNotFoundError("No module named 'textual'", name="textual")
+            return original_import(name, *args, **kwargs)
+
+        error = io.StringIO()
+        with patch("sys.argv", ["exercise.py"]), \
+                patch("builtins.__import__", side_effect=missing_textual), \
+                redirect_stderr(error), self.assertRaises(SystemExit) as raised:
+            exercise.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn(".venv/bin/python -m pip install -r requirements.txt", error.getvalue())
+        self.assertIn("--plain", error.getvalue())
+
+    def test_unrelated_missing_import_is_not_swallowed(self):
+        original_import = builtins.__import__
+
+        def missing_dependency(name, *args, **kwargs):
+            if name == "tui":
+                raise ModuleNotFoundError("No module named 'other'", name="other")
+            return original_import(name, *args, **kwargs)
+
+        with patch("sys.argv", ["exercise.py"]), \
+                patch("builtins.__import__", side_effect=missing_dependency), \
+                self.assertRaises(ModuleNotFoundError):
+            exercise.main()
+
+    def test_invalid_speed(self):
+        for speed in ("-1", "nan", "inf", "-inf"):
+            with self.subTest(speed=speed), \
+                    patch("sys.argv", ["exercise.py", "--plain", f"--speed={speed}"]), \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                exercise.main()
+            self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":
