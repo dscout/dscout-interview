@@ -16,10 +16,21 @@ with content-based cache reuse where inputs match. Successful artifacts are
 used for simulated releases. The starter in `pipeline.py` serializes the entire build-and-deploy
 pipeline, including the revisions submitted to it.
 
-**Improve throughput while preserving build and release correctness.** Keep
-all required build work (execution or valid cache reuse) and keep deployment
-simulated and local. Explain your design, how you tested it, your assumptions,
-and the tradeoffs you considered. State what release behavior you intend and
+**Allow build work from different revisions to run concurrently while keeping
+deployments serialized.** Improve throughput for a sequence of revisions while
+preserving build and release correctness. Keep all required build work
+(execution or valid cache reuse) and keep deployment simulated and local. Do
+not improve timings by reducing simulated delays, omitting required work, or
+weakening artifact validation.
+
+We care as much about the rigor of your verification as the implementation.
+A successful example run or passing the existing tests is not sufficient
+evidence that a concurrent implementation is correct. Identify the guarantees
+you intend to preserve, develop tests that challenge your assumptions, and
+explain what your evidence establishes and what remains unverified.
+
+Include a short summary of your design, comparative throughput evidence,
+tests, assumptions, and tradeoffs. State what release behavior you intend and
 why; ask for clarification if a requirement is ambiguous.
 
 AI coding agents are encouraged. You are responsible for understanding and
