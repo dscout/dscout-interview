@@ -1,0 +1,336 @@
+"""Live display for the local build exercise."""
+
+import asyncio
+from pathlib import Path
+from threading import Thread
+from time import monotonic
+
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Checkbox, DataTable, Footer, RichLog, Static
+
+from exercise import execute
+from simulation import APPS
+
+
+class Welcome(ModalScreen):
+    CSS = """
+    Welcome { align: center middle; }
+    #welcome-dialog {
+        width: 90%; min-width: 40; max-width: 76; height: auto;
+        max-height: 100%; border: thick $accent; padding: 1 2;
+    }
+    #welcome-title { text-style: bold; margin-bottom: 1; }
+    #welcome-content { height: auto; max-height: 14; }
+    #welcome-actions { height: 3; margin-top: 1; }
+    #welcome-actions Button { min-width: 10; margin-right: 1; }
+    """
+    BINDINGS = [Binding("escape,q,ctrl+c", "quit", "Quit")]
+
+    def __init__(self, existing_history: bool):
+        super().__init__()
+        self.existing_history = existing_history
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="welcome-dialog"):
+            yield Static("Build concurrency exercise", id="welcome-title")
+            with VerticalScroll(id="welcome-content"):
+                yield Static(
+                    "A monorepo with three apps: zorch, greeb, and blerg.\n"
+                    "Git commits are submitted to the pipeline, like CI.\n\n"
+                    "Your task: edit the declaration in pipeline.py so builds across\n"
+                    "revisions overlap, while keeping deployments one at a time.\n\n"
+                    "Releases are local and simulated: no actual deployment,\n"
+                    "and nothing changes in your checkout.\n\n"
+                    + ("Run existing history reuses saved history and completed cache entries."
+                       if self.existing_history else
+                       "The example submits initial sources, a greeb change,\n"
+                       "then a zorch change.")
+                )
+            with Horizontal(id="welcome-actions"):
+                yield Button("Run existing history" if self.existing_history else "Run example",
+                             variant="primary", id="run-example")
+                yield Button("Choose changes", id="choose-changes")
+                yield Button("Quit", id="welcome-quit")
+
+    def on_mount(self) -> None:
+        self.query_one("#run-example", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "welcome-quit":
+            self.action_quit()
+        else:
+            self.dismiss(event.button.id)
+
+    def action_quit(self) -> None:
+        self.app.action_safe_quit()
+
+
+class SourceCheckbox(Checkbox):
+    @property
+    def BUTTON_INNER(self):
+        return "X" if self.value else " "
+
+
+class NewChanges(ModalScreen):
+    CSS = """
+    NewChanges { align: center middle; }
+    #changes-dialog { width: 72; height: auto; border: thick $accent; padding: 1 2; }
+    #changes-title { text-style: bold; margin-bottom: 1; }
+    #selection-summary { height: 1; }
+    #batch-summary { height: auto; max-height: 6; overflow-y: auto; }
+    #changes-actions { height: 3; }
+    #changes-actions Button { min-width: 14; margin-right: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self):
+        super().__init__()
+        self.batch = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="changes-dialog"):
+            yield Static("New simulated changes", id="changes-title")
+            yield Static("Check a box to simulate Git changes for that app in the monorepo.\n"
+                         "The selected apps will change together in one new commit.\n\n"
+                         "Queue commit lets you prepare another commit before running.\n"
+                         "Run pipeline submits queued commits and any checked changes.")
+            for app in APPS:
+                yield SourceCheckbox(app, id=f"change-{app}")
+            yield Static(id="selection-summary", markup=False)
+            yield Static("No commits queued", id="batch-summary", markup=False)
+            with Horizontal(id="changes-actions"):
+                yield Button("Queue commit", id="queue-commit")
+                yield Button("Run pipeline", variant="primary", id="run-pipeline")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._update_selection()
+
+    def _selected(self):
+        return [app for app in APPS if self.query_one(f"#change-{app}", Checkbox).value]
+
+    def _update_selection(self) -> None:
+        selected = self._selected()
+        self.query_one("#selection-summary", Static).update(
+            f"Next commit: {', '.join(selected) or 'no source changes (empty commit)'}"
+        )
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        self._update_selection()
+
+    def _add_selection(self) -> None:
+        self.batch.append(self._selected())
+        for checkbox in self.query(Checkbox):
+            checkbox.value = False
+        self._update_selection()
+        self.query_one("#batch-summary", Static).update(
+            "Queued commits:\n" + "\n".join(
+                f"{index}. {', '.join(change) or 'none (empty commit)'}"
+                for index, change in enumerate(self.batch, 1)
+            )
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "queue-commit":
+            self._add_selection()
+        elif event.button.id == "run-pipeline":
+            if self._selected() or not self.batch:
+                self._add_selection()
+            self.dismiss(self.batch)
+        elif event.button.id == "cancel":
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class BuildApp(App):
+    CSS = """
+    #status { height: 2; }
+    #path { height: 2; }
+    #revisions { height: 8; }
+    #events { height: 1fr; }
+    """
+    BINDINGS = [
+        Binding("r", "rerun", "Rerun (warm cache)"),
+        Binding("n", "new_changes", "New changes"),
+        Binding("q,ctrl+c", "safe_quit", "Quit", priority=True),
+    ]
+
+    def __init__(self, directory: Path, speed: float):
+        super().__init__()
+        self.directory = Path(directory)
+        self.speed = speed
+        self.failed = False
+        self.running = False
+        self.simulation = None
+        self.states = {}
+        self._last_revisions = None
+        self._thread = None
+        self._error = None
+        self._started = None
+        self._ended = None
+
+    def compose(self) -> ComposeResult:
+        self._status = Static("Ready to run", id="status", markup=False)
+        yield self._status
+        yield Static(str(self.directory), id="path", markup=False)
+        yield DataTable(id="revisions")
+        yield RichLog(id="events", markup=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        for column in ("Revision", *APPS, "release"):
+            table.add_column(column, key=column)
+        table.cursor_type = "none"
+        self._status_timer = self.set_interval(0.1, self._update_status)
+        self._show_welcome()
+
+    def _show_welcome(self) -> None:
+        self.push_screen(Welcome((self.directory / "fixture.json").exists()), self._welcome_chosen)
+
+    def _welcome_chosen(self, choice) -> None:
+        if choice == "run-example":
+            self._start()
+        elif choice == "choose-changes":
+            self.action_new_changes()
+
+    def _start(self, changes=None) -> None:
+        self.running = True
+        self.failed = False
+        self.simulation = None
+        self._error = None
+        self._started = monotonic()
+        self._ended = None
+        self.states.clear()
+        self.query_one(DataTable).clear()
+        self.query_one(RichLog).clear()
+        self.query_one("#path", Static).update(f"Run directory: {self.directory}")
+        self._update_status()
+        options = {}
+        if changes is not None:
+            options["changes"] = changes
+        elif self._last_revisions is not None:
+            options["revisions"] = self._last_revisions
+        self._thread = Thread(target=self._run, kwargs=options)
+        self._thread.start()
+
+    def _run(self, **options) -> None:
+        try:
+            simulation = execute(
+                self.directory,
+                self.speed,
+                observer=lambda event: self.call_later(self._observe, event),
+                on_ready=lambda revisions: self.call_later(self._revisions_ready, revisions),
+                **options,
+            )
+            self.call_later(self._result, simulation)
+        except Exception as error:
+            self.call_later(self._record_error, error)
+        finally:
+            self.call_later(self._finish)
+
+    def _revisions_ready(self, revisions) -> None:
+        self._last_revisions = list(revisions)
+        table = self.query_one(DataTable)
+        for revision in self._last_revisions:
+            self.states[revision] = dict.fromkeys((*APPS, "release"), "pending")
+            table.add_row(revision[:12], *(Text("pending", style="dim") for _ in range(4)),
+                          key=revision)
+        self.query_one(RichLog).write(f"Revisions ready: {len(self._last_revisions)}")
+
+    def _observe(self, event) -> None:
+        revision, kind = event["revision"], event["kind"]
+        column = event.get("app", "release")
+        if kind in ("task_blocked", "task_skipped"):
+            task = event["task"]
+            column = "release" if task == "deploy" else task
+        status = {
+            "build_requested": "waiting (cache lock)",
+            "build_started": "building",
+            "cache_hit": "cache hit",
+            "build_finished": "finished (cache hit)" if event.get("cache_hit") else "finished",
+            "build_failed": "failed",
+            "deploy_requested": "ready",
+            "deploy_started": "deploying",
+            "deploy_finished": "finished",
+            "deploy_failed": "failed",
+            "task_blocked": "blocked",
+            "task_skipped": "skipped",
+        }.get(kind)
+        if status is not None and column in self.states[revision]:
+            self.states[revision][column] = status
+            style = ("bold red" if status in ("failed", "blocked") else "cyan" if "cache hit" in status
+                     else "green" if status == "finished" else "yellow")
+            label = {"waiting (cache lock)": "waiting",
+                     "finished (cache hit)": "cached"}.get(status, status)
+            self.query_one(DataTable).update_cell(revision, column, Text(label, style=style),
+                                                  update_width=True)
+        if kind.endswith("_failed"):
+            self.failed = True
+        hit = f" cache_hit={event['cache_hit']}" if "cache_hit" in event else ""
+        task = event.get("app", event.get("task", ""))
+        self.query_one(RichLog).write(f"{revision[:12]} {kind} {task}{hit}")
+
+    def _result(self, simulation) -> None:
+        self.simulation = simulation
+
+    def _record_error(self, error) -> None:
+        self.failed = True
+        self._error = f"{type(error).__name__}: {error}"
+        self.query_one(RichLog).write(f"FAILED: {self._error}")
+
+    async def _finish(self) -> None:
+        await asyncio.to_thread(self._thread.join)
+        self.running = False
+        self._ended = monotonic()
+        if not self.failed:
+            self.query_one(RichLog).write(f"Finished. Release: {self.directory / 'state/release.json'}")
+        self._update_status()
+
+    def _update_status(self) -> None:
+        if self._started is None:
+            return
+        elapsed = (self._ended or monotonic()) - self._started
+        state = "Running" if self.running else "FAILED" if self.failed else "Finished"
+        detail = self._error or ("Wait for completion before rerunning or quitting." if self.running
+                                 else "r: warm rerun · n: new changes · q: quit")
+        self._status.update(f"{state} · {elapsed:.1f}s\n{detail}")
+
+    def _busy(self) -> bool:
+        if not self.running:
+            return False
+        self.query_one(RichLog).write("Still running: must finish before rerunning or quitting.")
+        return True
+
+    def action_rerun(self) -> None:
+        if self._started is not None and not isinstance(self.screen, ModalScreen) and not self._busy():
+            self._start()
+
+    def action_new_changes(self) -> None:
+        if isinstance(self.screen, ModalScreen) or self._busy():
+            return
+        self.push_screen(NewChanges(), self._changes_chosen)
+
+    def _changes_chosen(self, changes) -> None:
+        if changes is not None:
+            self._start(changes=changes)
+        elif self._started is None:
+            self._show_welcome()
+
+    def action_safe_quit(self) -> None:
+        if not self._busy():
+            self.exit()
+
+    def action_quit(self) -> None:
+        self.action_safe_quit()
+
+    async def on_unmount(self) -> None:
+        self._status_timer.stop()
+        if self._thread is not None:
+            await asyncio.to_thread(self._thread.join)
