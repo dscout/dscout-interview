@@ -2,6 +2,7 @@ import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from textual.widgets import Button, Checkbox, DataTable, RichLog, Static
 
 from exercise import execute
+from fixture import git
 from simulation import APPS
 from tui import BuildApp, NewChanges, SourceCheckbox, Welcome
 from workflow import Build, Deploy, Pipeline
@@ -28,7 +30,8 @@ starter_pipeline = Pipeline(
 
 class TuiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        pipeline_patch = patch("exercise.pipeline", starter_pipeline)
+        pipeline_patch = patch("exercise.load_pipeline", return_value=starter_pipeline)
+        self.pipeline_patch = pipeline_patch
         pipeline_patch.start()
         self.addCleanup(pipeline_patch.stop)
         self.temporary = tempfile.TemporaryDirectory()
@@ -101,6 +104,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.click("#choose-changes")
                     await pilot.click("#change-greeb")
                     await pilot.click("#queue-commit")
+                    await pilot.click("#change-zorch")
+                    await pilot.click("#queue-example")
                     if cancel == "button":
                         await pilot.click("#cancel")
                     else:
@@ -136,7 +141,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 button = app.screen.query_one("#run-example", Button)
                 self.assertEqual(button.label.plain, "Run existing history")
                 instructions = "\n".join(str(widget.render()) for widget in app.screen.query(Static))
-                self.assertIn("saved history and completed cache", instructions)
+                self.assertIn("saved Git history", instructions)
+                self.assertNotIn("completed cache", instructions)
                 self.assertNotIn("initial sources", instructions)
                 mocked.assert_not_called()
                 await pilot.click("#run-example")
@@ -145,7 +151,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(app._last_revisions), 4)
                 self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
 
-    async def test_completion_and_warm_rerun(self):
+    async def test_completion_and_fresh_rerun(self):
         app = BuildApp(self.directory, 0)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.press("enter")
@@ -153,16 +159,37 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.failed)
             self.assertIsNotNone(app.simulation)
             self.assertEqual(app.query_one(DataTable).row_count, 3)
+            for revision in app.states:
+                events = [event for event in app.simulation.events()
+                          if event["revision"] == revision]
+                duration = max(event["time"] for event in events) - min(
+                    event["time"] for event in events)
+                self.assertEqual(app.query_one(DataTable).get_cell(revision, "Duration"),
+                                 f"{duration:.2f}s")
             self.assertTrue(all(row["release"] == "finished" for row in app.states.values()))
-            self.assertIn("Finished", str(app.query_one("#status", Static).render()))
+            status = str(app.query_one("#status", Static).render())
+            self.assertIn("Finished", status)
+            self.assertRegex(status, r"Finished · \d+\.\d{2}s")
+            first = app.simulation
+            first_events = first.events()
+            first_hits = {(event["revision"], event["app"]): event["cache_hit"]
+                          for event in first_events if event["kind"] == "build_finished"}
+            self.assertEqual([[first_hits[revision, name] for name in APPS]
+                              for revision in app._last_revisions],
+                             [[False, False, False], [True, False, False], [False, True, True]])
+            log = "\n".join(line.text for line in app.query_one(RichLog).lines)
+            self.assertIn(str(first.state / "release.json"), log)
             await pilot.press("r")
             await self.finished(app, pilot)
             builds = [event for event in app.simulation.events()
                       if event["kind"] == "build_finished"]
-            self.assertEqual(len(builds), 18)
-            self.assertTrue(all(event["cache_hit"] for event in builds[-9:]))
-            self.assertTrue(all(row[app_name] == "finished (cache hit)"
-                                for row in app.states.values() for app_name in APPS))
+            self.assertEqual(len(builds), 9)
+            self.assertEqual({(event["revision"], event["app"]): event["cache_hit"]
+                              for event in builds}, first_hits)
+            self.assertNotEqual(app.simulation.state, first.state)
+            self.assertEqual(app.simulation.state.parent, self.directory / "runs")
+            self.assertTrue(first.state.exists())
+            self.assertEqual(first.events(), first_events)
 
     async def test_new_changes_cancel_and_escape_preserve_run(self):
         app = BuildApp(self.directory, 0)
@@ -172,11 +199,19 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             original_revisions = app._last_revisions.copy()
             original_manifest = (self.directory / "fixture.json").read_bytes()
             original_events = app.simulation.events()
+            repo = self.directory / "repo"
+            original_head = git(repo, "rev-parse", "HEAD")
+            cache = app.simulation.state / "cache"
+            original_cache = {path: path.read_bytes() for path in cache.glob("*.json")}
             for cancel in ("button", "escape"):
                 await pilot.press("n")
                 self.assertIsInstance(app.screen, NewChanges)
                 await pilot.click("#change-greeb")
                 await pilot.click("#queue-commit")
+                await pilot.click("#change-zorch")
+                await pilot.click("#queue-example")
+                self.assertEqual(app.screen.batch, [["greeb"], [], ["greeb"], ["zorch"]])
+                self.assertTrue(app.screen.query_one("#change-zorch", Checkbox).value)
                 await pilot.press("r", "n")
                 self.assertFalse(app.running)
                 if cancel == "button":
@@ -187,6 +222,9 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app._last_revisions, original_revisions)
                 self.assertEqual((self.directory / "fixture.json").read_bytes(), original_manifest)
                 self.assertEqual(app.simulation.events(), original_events)
+                self.assertEqual(git(repo, "rev-parse", "HEAD"), original_head)
+                self.assertEqual({path: path.read_bytes() for path in cache.glob("*.json")},
+                                 original_cache)
                 self.assertEqual(app.query_one(DataTable).row_count, 3)
             self.assertEqual(app.directory, self.directory)
         self.assertTrue(self.directory.exists())
@@ -227,7 +265,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                              f"{checkbox.BUTTON_LEFT} {checkbox.BUTTON_RIGHT}")
             await pilot.press("escape")
 
-    async def test_new_changes_batch_and_warm_rerun(self):
+    async def test_new_changes_batch_and_fresh_rerun(self):
         app = BuildApp(self.directory, 0)
         async with app.run_test(size=(120, 35)) as pilot:
             await pilot.press("enter")
@@ -257,18 +295,113 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                       if event["kind"] == "build_finished" and event["revision"] in batch]
             self.assertEqual(len(builds), 6)
             hits = {(event["revision"], event["app"]): event["cache_hit"] for event in builds}
-            self.assertEqual([hits[batch[0], name] for name in APPS], [False, True, True])
+            self.assertEqual([hits[batch[0], name] for name in APPS], [False, False, False])
             self.assertEqual([hits[batch[1], name] for name in APPS], [True, False, False])
             await pilot.press("r")
             await self.finished(app, pilot)
             self.assertFalse(app.failed)
             self.assertEqual(app._last_revisions, batch)
             self.assertEqual(app.query_one(DataTable).row_count, 2)
-            self.assertTrue(all(row[name] == "finished (cache hit)"
-                                for row in app.states.values() for name in APPS))
+            rerun_hits = {(event["revision"], event["app"]): event["cache_hit"]
+                          for event in app.simulation.events()
+                          if event["kind"] == "build_finished"}
+            self.assertEqual(rerun_hits, hits)
             self.assertEqual(json.loads((self.directory / "fixture.json").read_text())["revisions"],
                              history + batch)
             self.assertEqual(app.directory, self.directory)
+
+    async def test_queue_example_appends_history_and_fresh_rerun(self):
+        app = BuildApp(self.directory, 0)
+        with patch("tui.execute", wraps=execute) as mocked:
+            async with app.run_test(size=(120, 35)) as pilot:
+                await pilot.press("enter")
+                await self.finished(app, pilot)
+                history = app._last_revisions.copy()
+                original_simulation = app.simulation
+                original_events = app.simulation.events()
+                repo = self.directory / "repo"
+                cache = app.simulation.state / "cache"
+                original_cache = {path: path.read_bytes() for path in cache.glob("*.json")}
+                self.assertTrue(original_cache)
+                await pilot.press("n")
+                button = app.screen.query_one("#queue-example", Button)
+                self.assertEqual(button.label.plain, "Queue example (3 commits)")
+                await pilot.click("#queue-example")
+                self.assertEqual(app.screen.batch, [[], ["greeb"], ["zorch"]])
+                summary = str(app.screen.query_one("#batch-summary", Static).render())
+                for text in ("1. none (empty commit)", "2. greeb", "3. zorch"):
+                    self.assertIn(text, summary)
+                self.assertEqual(mocked.call_count, 1)
+                await pilot.click("#run-pipeline")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                self.assertEqual(mocked.call_args.kwargs["changes"], [[], ["greeb"], ["zorch"]])
+                batch = app._last_revisions.copy()
+                self.assertEqual(len(set(batch)), 3)
+                self.assertTrue(set(batch).isdisjoint(history))
+                self.assertEqual(app.query_one(DataTable).row_count, 3)
+                manifest = (self.directory / "fixture.json").read_bytes()
+                self.assertEqual(json.loads(manifest)["revisions"], history + batch)
+                for previous, revision, changed in zip(history[-1:] + batch, batch,
+                                                       ("", "source/greeb.txt", "source/zorch.txt")):
+                    self.assertEqual(git(repo, "rev-parse", f"{revision}^"), previous)
+                    self.assertEqual(git(repo, "diff-tree", "--no-commit-id", "--name-only",
+                                         "-r", revision), changed)
+                self.assertEqual(git(repo, "show", f"{batch[1]}:source/greeb.txt"), "greeb-v3")
+                self.assertEqual(git(repo, "show", f"{batch[2]}:source/zorch.txt"), "zorch-v3")
+                for path, content in original_cache.items():
+                    self.assertEqual(path.read_bytes(), content)
+                events = app.simulation.events()
+                self.assertEqual(original_simulation.events(), original_events)
+                self.assertNotEqual(app.simulation.state, original_simulation.state)
+                builds = [event for event in events
+                          if event["kind"] == "build_finished" and event["revision"] in batch]
+                self.assertEqual(len(builds), 9)
+                hits = {(event["revision"], event["app"]): event["cache_hit"] for event in builds}
+                self.assertEqual([[hits[revision, name] for name in APPS] for revision in batch],
+                                 [[False, False, False], [True, False, False], [False, True, True]])
+                await pilot.press("r")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                self.assertEqual(mocked.call_args.kwargs["revisions"], batch)
+                self.assertNotIn("changes", mocked.call_args.kwargs)
+                self.assertEqual(app._last_revisions, batch)
+                self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
+                self.assertEqual(git(repo, "rev-parse", "HEAD"), batch[-1])
+                self.assertEqual(app.directory, self.directory)
+                builds = [event for event in app.simulation.events()
+                          if event["kind"] == "build_finished"]
+                self.assertEqual(len(builds), 9)
+                self.assertEqual({(event["revision"], event["app"]): event["cache_hit"]
+                                  for event in builds}, hits)
+                self.assertTrue(all(call.kwargs["reset_state"] for call in mocked.call_args_list))
+
+    async def test_queue_example_preserves_queued_and_pending_choices(self):
+        app = BuildApp(self.directory, 0)
+        with patch("tui.execute", wraps=execute) as mocked:
+            async with app.run_test(size=(120, 35)) as pilot:
+                await pilot.click("#choose-changes")
+                await pilot.click("#change-blerg")
+                await pilot.click("#queue-commit")
+                await pilot.click("#change-zorch")
+                await pilot.click("#change-greeb")
+                selection = str(app.screen.query_one("#selection-summary", Static).render())
+                await pilot.click("#queue-example")
+                expected = [["blerg"], [], ["greeb"], ["zorch"]]
+                self.assertEqual(app.screen.batch, expected)
+                self.assertTrue(app.screen.query_one("#change-zorch", Checkbox).value)
+                self.assertTrue(app.screen.query_one("#change-greeb", Checkbox).value)
+                self.assertFalse(app.screen.query_one("#change-blerg", Checkbox).value)
+                self.assertEqual(str(app.screen.query_one("#selection-summary", Static).render()),
+                                 selection)
+                mocked.assert_not_called()
+                self.assertFalse(self.directory.exists())
+                await pilot.click("#run-pipeline")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                self.assertEqual(mocked.call_args.kwargs["changes"], expected + [["zorch", "greeb"]])
+                self.assertEqual(len(set(app._last_revisions)), 5)
+                self.assertEqual(app.query_one(DataTable).row_count, 5)
 
     async def test_run_queued_changes_does_not_add_empty_selection(self):
         app = BuildApp(self.directory, 0)
@@ -299,8 +432,12 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.failed)
             self.assertEqual(len(app._last_revisions), 1)
             self.assertNotIn(app._last_revisions[0], history)
-            self.assertTrue(all(row[name] == "finished (cache hit)"
+            self.assertTrue(all(row[name] == "finished"
                                 for row in app.states.values() for name in APPS))
+            builds = [event for event in app.simulation.events()
+                      if event["kind"] == "build_finished"]
+            self.assertEqual(len(builds), 3)
+            self.assertFalse(any(event["cache_hit"] for event in builds))
 
     async def test_pipeline_events_and_blocked_tasks(self):
         app = BuildApp(self.directory, 0)
@@ -309,6 +446,10 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             await self.finished(app, pilot)
             revision = app._last_revisions[0]
             original = app.states[revision].copy()
+            app._revision_times.clear()
+            for timestamp in (10.0, 11.234, 10.5):
+                app._observe(dict(revision=revision, kind="pipeline_started", time=timestamp))
+            self.assertEqual(app.query_one(DataTable).get_cell(revision, "Duration"), "1.23s")
             for kind in ("pipeline_waiting", "pipeline_started", "pipeline_finished"):
                 app._observe(dict(revision=revision, kind=kind, pipeline="builds"))
                 self.assertEqual(app.states[revision], original)
@@ -326,6 +467,81 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             log = "\n".join(line.text for line in app.query_one(RichLog).lines)
             self.assertIn("task_blocked blerg", log)
             self.assertIn("pipeline_failed", log)
+
+    async def test_hot_reload_rerun_new_changes_and_syntax_recovery(self):
+        self.pipeline_patch.stop()
+        declaration = Path(self.temporary.name) / "pipeline.py"
+
+        def edit_pipeline(pool):
+            declaration.write_text(
+                "from workflow import Build, Deploy, Pipeline\n"
+                f"pipeline = Pipeline(pool={pool!r}, tasks=[\n"
+                "    Build('zorch'), Build('greeb'), Build('blerg', needs=['greeb']),\n"
+                "    Deploy('release', needs=['zorch', 'greeb', 'blerg']),\n"
+                "])\n"
+            )
+
+        def assert_pool(simulation, pool):
+            events = [event for event in simulation.events()
+                      if event["kind"] == "pipeline_started"]
+            self.assertTrue(events)
+            self.assertEqual({event["pool"] for event in events}, {pool})
+
+        edit_pipeline("first")
+        app = BuildApp(self.directory, 0)
+        with patch("exercise.PIPELINE_PATH", declaration):
+            async with app.run_test(size=(120, 35)) as pilot:
+                await pilot.press("enter")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                first = app.simulation
+                first_events = first.events()
+                assert_pool(first, "first")
+                manifest = (self.directory / "fixture.json").read_bytes()
+                revisions = app._last_revisions.copy()
+                edit_pipeline("rerun")
+                await pilot.press("r")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                rerun = app.simulation
+                assert_pool(rerun, "rerun")
+                self.assertNotEqual(first.state, rerun.state)
+                self.assertEqual(app._last_revisions, revisions)
+                self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
+                edit_pipeline("changes")
+                await pilot.press("n")
+                await pilot.click("#change-greeb")
+                await pilot.click("#run-pipeline")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                changed = app.simulation
+                assert_pool(changed, "changes")
+                self.assertEqual(len(app._last_revisions), 1)
+                self.assertNotEqual(changed.state, rerun.state)
+                manifest = (self.directory / "fixture.json").read_bytes()
+                head = git(self.directory / "repo", "rev-parse", "HEAD")
+                declaration.write_text("pipeline = (\n")
+                await pilot.press("n")
+                await pilot.click("#change-zorch")
+                await pilot.click("#run-pipeline")
+                await self.finished(app, pilot)
+                self.assertTrue(app.failed)
+                self.assertIn("SyntaxError", str(app.query_one("#status", Static).render()))
+                log = "\n".join(line.text for line in app.query_one(RichLog).lines)
+                self.assertIn("SyntaxError", log)
+                self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
+                self.assertEqual(git(self.directory / "repo", "rev-parse", "HEAD"), head)
+                self.assertEqual(len(list((self.directory / "runs").iterdir())), 3)
+                edit_pipeline("recovered")
+                await pilot.press("r")
+                await self.finished(app, pilot)
+                self.assertFalse(app.failed)
+                assert_pool(app.simulation, "recovered")
+                self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
+                self.assertEqual(first.events(), first_events)
+                for simulation in (first, rerun, changed, app.simulation):
+                    self.assertTrue((simulation.state / "release.json").exists())
+                self.assertEqual(len(list((self.directory / "runs").iterdir())), 4)
 
     async def test_worker_failure_visible_and_rerunnable(self):
         app = BuildApp(self.directory, 0)
@@ -359,14 +575,15 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 unmounting.set()
                 await super().on_unmount()
 
-        def controlled(directory, speed, *, observer, on_ready):
+        def controlled(directory, speed, *, observer, on_ready, reset_state):
+            self.assertTrue(reset_state)
             started.set()
             if not release.wait(5):
                 raise TimeoutError("test release")
             on_ready(["revision"])
             observer(dict(revision="revision", kind="deploy_finished"))
             existed_at_completion.append(directory.exists())
-            return object()
+            return SimpleNamespace(state=directory / "runs/run-test")
 
         app = ImmediateExitApp(directory, 0)
 
@@ -404,7 +621,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 unmounting.set()
                 await super().on_unmount()
 
-        def controlled(directory, speed, *, observer, on_ready, revisions):
+        def controlled(directory, speed, *, observer, on_ready, revisions, reset_state):
+            self.assertTrue(reset_state)
             self.assertEqual(revisions, app._last_revisions)
             on_ready(["revision"])
             started.set()
@@ -450,7 +668,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         started = threading.Event()
         self.addCleanup(release.set)
 
-        def controlled(directory, speed, *, observer, on_ready):
+        def controlled(directory, speed, *, observer, on_ready, reset_state):
+            self.assertTrue(reset_state)
             on_ready(["revision"])
             observer(dict(revision="revision", app="zorch", kind="build_requested"))
             started.set()

@@ -1,25 +1,50 @@
 """Command-line driver for a disposable local exercise."""
 
 import argparse
+import importlib.util
 import json
 import math
 from pathlib import Path
+import sys
 import tempfile
 
 from fixture import add_changes, create_history, validate_apps
-from pipeline import pipeline
-from workflow import execute_pipeline
+from workflow import execute_pipeline, validate
 from simulation import Simulation, file_lock
 
 
+PIPELINE_PATH = Path(__file__).with_name("pipeline.py")
+
+
+def load_pipeline():
+    """Evaluate pipeline.py from source; imported helper modules are not reloaded."""
+    path = PIPELINE_PATH.resolve()
+    code = compile(path.read_bytes(), str(path), "exec")
+    spec = importlib.util.spec_from_file_location("pipeline", path)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get("pipeline")
+    sys.modules["pipeline"] = module
+    try:
+        exec(code, module.__dict__)
+        return module.pipeline
+    except BaseException:
+        if previous is None:
+            sys.modules.pop("pipeline", None)
+        else:
+            sys.modules["pipeline"] = previous
+        raise
+
+
 def execute(directory, speed, *, observer=None, on_ready=None, changes=None,
-            revisions=None):
+            revisions=None, reset_state=False):
     if changes is not None and revisions is not None:
         raise ValueError("changes and revisions are mutually exclusive")
     if changes is not None:
         changes = [validate_apps(apps) for apps in changes]
     if revisions is not None:
         revisions = list(revisions)
+    pipeline = load_pipeline()
+    validate(pipeline)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     manifest = directory / "fixture.json"
@@ -50,7 +75,12 @@ def execute(directory, speed, *, observer=None, on_ready=None, changes=None,
         hit = f" cache_hit={event['cache_hit']}" if "cache_hit" in event else ""
         print(f"{event['revision'][:12]} {event['kind']} {app}{hit}", flush=True)
 
-    sim = Simulation(directory / "repo", directory / "state", speed=speed,
+    state = directory / "state"
+    if reset_state:
+        runs = directory / "runs"
+        runs.mkdir(exist_ok=True)
+        state = Path(tempfile.mkdtemp(prefix="run-", dir=runs))
+    sim = Simulation(directory / "repo", state, speed=speed,
                      observer=show if observer is None else observer)
     execute_pipeline(sim, pipeline, revisions)
     if observer is None:

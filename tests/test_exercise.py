@@ -32,7 +32,7 @@ starter_pipeline = Pipeline(
 
 class ExerciseTests(unittest.TestCase):
     def setUp(self):
-        pipeline_patch = patch("exercise.pipeline", starter_pipeline)
+        pipeline_patch = patch("exercise.load_pipeline", return_value=starter_pipeline)
         pipeline_patch.start()
         self.addCleanup(pipeline_patch.stop)
         self.directory = tempfile.TemporaryDirectory()

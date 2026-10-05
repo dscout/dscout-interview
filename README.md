@@ -23,7 +23,7 @@ activation is needed; delete `.venv/` to remove them.
 The UI opens with a welcome dialog; nothing runs until you choose.
 **Run example** submits the supplied three-commit scenario, or **Choose changes**
 lets you prepare your own commits first. With a retained run directory, the first
-choice becomes **Run existing history**, reusing its saved history and cache.
+choice becomes **Run existing history**, submitting its saved commits.
 
 During a run, the UI shows each revision's builds, cache hits, and release
 alongside a live event log and elapsed time. After a run, press
@@ -33,12 +33,20 @@ to quit. These controls are available after the current run finishes.
 In **New changes**, check a box to simulate Git changes for that app in the
 monorepo. The checked apps change together in one new commit. **Queue commit**
 queues that commit and resets the checkboxes so you can prepare another.
+**Queue example (3 commits)** adds a no-source-change commit, a `greeb` change,
+and a `zorch` change to the queue, using the current repo.
 **Run pipeline** submits the queued commits plus any currently checked changes.
 With no queued or checked changes, it submits an empty commit with no source
 changes. Every revision still needs all three builds or valid cache hits.
 
 The commits are generated automatically and deterministically in the disposable
-repo; no Git work is required from you. New batches reuse the same cache.
+repo; no Git work is required from you.
+
+Every UI submission reloads `pipeline.py` and starts with fresh simulation state.
+**Rerun** replays the same commits so timing improvements reflect your pipeline
+edits, not cache entries left by an earlier run. Cache reuse still happens between
+commits within a run. Imported helper modules are not automatically reloaded;
+restart the UI after editing those.
 The default run directory is removed on exit; `--directory` retains it.
 
 For agents, scripts, or a noninteractive terminal, use plain output:
@@ -92,12 +100,14 @@ To keep the history and results, use a fresh directory outside your checkout:
 RUN_DIR="$(mktemp -d)"
 .venv/bin/python -B exercise.py --directory "$RUN_DIR"
 git -C "$RUN_DIR/repo" log --oneline --stat
-python3 -m json.tool "$RUN_DIR/state/release.json"
+# Use the release path shown in the UI event log:
+python3 -m json.tool "$RUN_DIR/runs/<run-id>/release.json"
 ```
 
-Run again with the same `--directory` to reuse the history and completed cache
-entries. Events are appended. Use a fresh directory for a cold cache, and remove
-it when you're done: `rm -rf "$RUN_DIR"`.
+Run again with the same `--directory` to reuse the Git history. Each UI run keeps
+its own results under `runs/`, without reusing earlier runs' cache entries.
+Plain mode uses `state/` and retains its cache across invocations.
+Remove the directory when you're done: `rm -rf "$RUN_DIR"`.
 
 Uncached builds take 0.3 seconds for `zorch` and 0.6 seconds each for `greeb` and
 `blerg`; a release takes 0.2 seconds. `--speed 0` removes delays for quick checks,
@@ -169,7 +179,8 @@ cache hits still produce artifacts associated with the requested revision.
 
 ### Output files
 
-In a retained run directory, you'll find:
+In a retained run directory, you'll find the files below. UI results live under
+`runs/<run-id>/` instead of `state/`, with a separate directory for each run:
 
 - `fixture.json` and `repo/`: revision IDs and Git history.
 - `state/events.jsonl`: build/release events, cache keys, and cache hits.

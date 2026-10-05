@@ -13,6 +13,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Footer, RichLog, Static
 
 from exercise import execute
+from flow import render_flow
+from pipeline import pipeline
 from simulation import APPS
 
 
@@ -45,7 +47,7 @@ class Welcome(ModalScreen):
                     "revisions overlap, while keeping deployments one at a time.\n\n"
                     "Releases are local and simulated: no actual deployment,\n"
                     "and nothing changes in your checkout.\n\n"
-                    + ("Run existing history reuses saved history and completed cache entries."
+                    + ("Run existing history submits the saved Git history."
                        if self.existing_history else
                        "The example submits initial sources, a greeb change,\n"
                        "then a zorch change.")
@@ -78,7 +80,10 @@ class SourceCheckbox(Checkbox):
 class NewChanges(ModalScreen):
     CSS = """
     NewChanges { align: center middle; }
-    #changes-dialog { width: 72; height: auto; border: thick $accent; padding: 1 2; }
+    #changes-dialog {
+        width: 72; height: auto; max-height: 100%; overflow-y: auto;
+        border: thick $accent; padding: 1 2;
+    }
     #changes-title { text-style: bold; margin-bottom: 1; }
     #selection-summary { height: 1; }
     #batch-summary { height: auto; max-height: 6; overflow-y: auto; }
@@ -101,6 +106,7 @@ class NewChanges(ModalScreen):
             for app in APPS:
                 yield SourceCheckbox(app, id=f"change-{app}")
             yield Static(id="selection-summary", markup=False)
+            yield Button("Queue example (3 commits)", id="queue-example")
             yield Static("No commits queued", id="batch-summary", markup=False)
             with Horizontal(id="changes-actions"):
                 yield Button("Queue commit", id="queue-commit")
@@ -127,6 +133,9 @@ class NewChanges(ModalScreen):
         for checkbox in self.query(Checkbox):
             checkbox.value = False
         self._update_selection()
+        self._update_queue()
+
+    def _update_queue(self) -> None:
         self.query_one("#batch-summary", Static).update(
             "Queued commits:\n" + "\n".join(
                 f"{index}. {', '.join(change) or 'none (empty commit)'}"
@@ -137,6 +146,9 @@ class NewChanges(ModalScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "queue-commit":
             self._add_selection()
+        elif event.button.id == "queue-example":
+            self.batch.extend([[], ["greeb"], ["zorch"]])
+            self._update_queue()
         elif event.button.id == "run-pipeline":
             if self._selected() or not self.batch:
                 self._add_selection()
@@ -152,11 +164,12 @@ class BuildApp(App):
     CSS = """
     #status { height: 2; }
     #path { height: 2; }
+    #flow { height: auto; max-height: 10; overflow-y: auto; border: round $accent; }
     #revisions { height: 8; }
     #events { height: 1fr; }
     """
     BINDINGS = [
-        Binding("r", "rerun", "Rerun (warm cache)"),
+        Binding("r", "rerun", "Rerun"),
         Binding("n", "new_changes", "New changes"),
         Binding("q,ctrl+c", "safe_quit", "Quit", priority=True),
     ]
@@ -169,6 +182,7 @@ class BuildApp(App):
         self.running = False
         self.simulation = None
         self.states = {}
+        self._revision_times = {}
         self._last_revisions = None
         self._thread = None
         self._error = None
@@ -179,13 +193,15 @@ class BuildApp(App):
         self._status = Static("Ready to run", id="status", markup=False)
         yield self._status
         yield Static(str(self.directory), id="path", markup=False)
+        yield Static(render_flow(pipeline) + "\nEdges show needs; independent tasks may overlap. "
+                     "Levels are not execution barriers.", id="flow", markup=False)
         yield DataTable(id="revisions")
         yield RichLog(id="events", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        for column in ("Revision", *APPS, "release"):
+        for column in ("Revision", *APPS, "release", "Duration"):
             table.add_column(column, key=column)
         table.cursor_type = "none"
         self._status_timer = self.set_interval(0.1, self._update_status)
@@ -208,6 +224,7 @@ class BuildApp(App):
         self._started = monotonic()
         self._ended = None
         self.states.clear()
+        self._revision_times.clear()
         self.query_one(DataTable).clear()
         self.query_one(RichLog).clear()
         self.query_one("#path", Static).update(f"Run directory: {self.directory}")
@@ -225,6 +242,7 @@ class BuildApp(App):
             simulation = execute(
                 self.directory,
                 self.speed,
+                reset_state=True,
                 observer=lambda event: self.call_later(self._observe, event),
                 on_ready=lambda revisions: self.call_later(self._revisions_ready, revisions),
                 **options,
@@ -241,11 +259,19 @@ class BuildApp(App):
         for revision in self._last_revisions:
             self.states[revision] = dict.fromkeys((*APPS, "release"), "pending")
             table.add_row(revision[:12], *(Text("pending", style="dim") for _ in range(4)),
-                          key=revision)
+                          "—", key=revision)
         self.query_one(RichLog).write(f"Revisions ready: {len(self._last_revisions)}")
 
     def _observe(self, event) -> None:
         revision, kind = event["revision"], event["kind"]
+        if "time" in event:
+            started, ended = self._revision_times.get(revision, (event["time"], event["time"]))
+            started, ended = min(started, event["time"]), max(ended, event["time"])
+            self._revision_times[revision] = started, ended
+            self.query_one(DataTable).update_cell(
+                revision, "Duration", f"{ended - started:.2f}s",
+                update_width=True,
+            )
         column = event.get("app", "release")
         if kind in ("task_blocked", "task_skipped"):
             task = event["task"]
@@ -290,7 +316,7 @@ class BuildApp(App):
         self.running = False
         self._ended = monotonic()
         if not self.failed:
-            self.query_one(RichLog).write(f"Finished. Release: {self.directory / 'state/release.json'}")
+            self.query_one(RichLog).write(f"Finished. Release: {self.simulation.state / 'release.json'}")
         self._update_status()
 
     def _update_status(self) -> None:
@@ -299,8 +325,8 @@ class BuildApp(App):
         elapsed = (self._ended or monotonic()) - self._started
         state = "Running" if self.running else "FAILED" if self.failed else "Finished"
         detail = self._error or ("Wait for completion before rerunning or quitting." if self.running
-                                 else "r: warm rerun · n: new changes · q: quit")
-        self._status.update(f"{state} · {elapsed:.1f}s\n{detail}")
+                                 else "r: rerun · n: new changes · q: quit")
+        self._status.update(f"{state} · {elapsed:.2f}s\n{detail}")
 
     def _busy(self) -> bool:
         if not self.running:
