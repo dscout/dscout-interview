@@ -27,7 +27,8 @@ class FlowTests(unittest.TestCase):
                                       Build("blerg", needs=["greeb"])])
         output = live_flow(declaration, {"zorch": "building", "greeb": "finished (cache hit)"},
                            "abcdef123456789").plain
-        self.assertIn("abcdef123456", output)
+        self.assertIn("PR (tip SHA): abcdef123456", output)
+        self.assertNotIn("Commit:", output)
         self.assertIn("building", output)
         self.assertIn("cached", output)
         self.assertTrue(any("zorch" in line and "greeb" in line for line in output.splitlines()))
@@ -144,7 +145,8 @@ class FlowTests(unittest.TestCase):
         ])
         output = live_flow(declaration, {"one": "failed", "two": "finished (cache hit)",
                                          "three": "finished", "four": "deploying"})
-        self.assertIn("Commit: select a commit", output.plain)
+        self.assertIn("PR (tip SHA): select a PR", output.plain)
+        self.assertNotIn("select a commit", output.plain)
         self.assertIn("Pool: example", output.plain)
         for name, style in (("one", "red"), ("two", "cyan"), ("three", "green"),
                             ("four", "bold yellow")):

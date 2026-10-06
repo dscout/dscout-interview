@@ -22,31 +22,37 @@ activation is needed; delete `.venv/` to remove them. `./run` uses the checkout'
 virtualenv and forwards arguments to `exercise.py`.
 
 The UI opens with a welcome dialog; nothing runs until you choose.
-**Run example** submits the supplied three-commit scenario, or **Choose changes**
-lets you prepare your own commits first. With a retained run directory, the first
-choice becomes **Run existing history**, submitting its saved commits.
+**Run example (3 PRs)** submits the supplied three-PR scenario, or **Choose PR changes**
+lets you prepare your own simulated PRs first. With a retained run directory, the
+first choice becomes **Run saved PRs**, submitting its saved PR tips.
 
-During a run, the UI shows each revision's builds, cache hits, and release
-alongside a live event log and elapsed time. After a run, press
+During a run, the UI shows each PR's tip SHA, builds, cache hits, and release
+alongside a live event log and elapsed time. Select log text with the mouse or
+Shift+arrow keys and press **Ctrl+C** to copy it. Clipboard integration depends on
+your terminal supporting OSC 52. The log is read-only; selecting text pauses its
+auto-scroll. After a run, press
 **r** to rerun the last batch, **n** to choose new simulated changes, or **q**
 to quit. These controls are available after the current run finishes.
 
-In **New changes**, check a box to simulate Git changes for that app in the
-monorepo. The checked apps change together in one new commit. **Queue commit**
-queues that commit and resets the checkboxes so you can prepare another.
-**Queue example (3 commits)** adds a no-source-change commit, a `greeb` change,
+In **New simulated PRs**, check a box to simulate Git changes for that app in the
+monorepo. The checked apps change together in one simulated merged PR. **Queue PR**
+queues that PR and resets the checkboxes so you can prepare another.
+**Queue example (3 PRs)** adds a no-source-change PR, a `greeb` change,
 and a `zorch` change to the queue, using the current repo.
-**Run pipeline** submits the queued commits plus any currently checked changes.
-With no queued or checked changes, it submits an empty commit with no source
-changes. Every revision still needs all three builds or valid cache hits.
+**Run pipeline** submits the queued PRs plus any currently checked changes.
+With no queued or checked changes, it submits a PR with no source changes.
+Every PR still needs all three builds or valid cache hits.
 
-The commits are generated automatically and deterministically in the disposable
-repo; no Git work is required from you.
+A real PR may contain many commits; this fixture represents each merged PR with
+one commit at its resulting tip. That SHA identifies the source snapshot passed
+to its build/deploy pipeline. These commits are generated automatically and
+deterministically in a disposable local repo; no Git work or actual PR merging
+is required from you.
 
 Every UI submission reloads `pipeline.py` and starts with fresh simulation state.
-**Rerun** replays the same commits so timing improvements reflect your pipeline
+**Rerun** replays the same PR tips so timing improvements reflect your pipeline
 edits, not cache entries left by an earlier run. Cache reuse still happens between
-commits within a run. Imported helper modules are not automatically reloaded;
+PRs within a run. Imported helper modules are not automatically reloaded;
 restart the UI after editing those.
 The default run directory is removed on exit; `--directory` retains it.
 
@@ -59,16 +65,16 @@ For agents, scripts, or a noninteractive terminal, use plain output:
 ## The task
 
 This little monorepo has three apps: `zorch`, `greeb`, and `blerg`.
-`blerg` depends on `greeb`. Each revision needs all three built, though unchanged
+`blerg` depends on `greeb`. Each merged PR needs all three built, though unchanged
 inputs can reuse cached builds. The results go into a simulated release.
 
 `pipeline.py` declares the build steps and their dependencies. The driver submits
-Git commits to that pipeline, like commits arriving at CI. Independent steps can
-run together, but the starter's capacity-one pool lets only one commit's pipeline
-run at a time.
+PR tip commit IDs to that pipeline, like merged PRs arriving at CI. Independent
+steps can run together, but the starter's capacity-one pool lets only one PR's
+pipeline run at a time.
 
-**Let builds for different revisions overlap, while keeping deployments one
-at a time.** Make a sequence of revisions faster without breaking the build or
+**Let builds for different PRs overlap, while keeping deployments one
+at a time.** Make a sequence of merged PRs faster without breaking the build or
 release behavior. Keep all required builds (or valid cache hits), and keep
 releases local and simulated. Don't speed things up by shortening the delays,
 skipping required work, or relaxing artifact checks.
@@ -80,7 +86,7 @@ check the simulation; passing them isn't enough to verify your new pipeline.
 Include a short write-up:
 
 - What did you change, and how much faster is it than the starter?
-- What should happen when revisions are released, and why did you choose that behavior?
+- What should happen when PRs are released, and why did you choose that behavior?
 - How did you test it? What do those tests show, and what haven't you checked?
 - What assumptions or tradeoffs did you make?
 
@@ -89,9 +95,10 @@ understanding and checking the result. Ask us if a requirement is unclear.
 
 ## Inspect a run
 
-**Run example** creates a temporary Git repo with three real commits: initial
-sources, a `greeb` change, then a `zorch` change. Choosing your own changes first
-initializes the same source history but submits only your new commits. Plain
+**Run example (3 PRs)** creates a temporary Git repo with three real commits representing
+merged PR tips: initial sources, a `greeb` change, then a `zorch` change. Choosing
+your own changes first initializes the same source history but submits only your
+new simulated PR tips. Plain
 mode runs the supplied history immediately. The temporary repo is cleaned up
 when you exit. Nothing is pushed or changed in your checkout.
 
@@ -141,7 +148,7 @@ lists, not braces (which create sets). These checks don't verify concurrency.
 
 Use the Python declarations in `workflow.py`; no YAML or scheduler code is needed:
 
-- `Pipeline(tasks=[...], pool=None)`: runs once per submitted commit. A named
+- `Pipeline(tasks=[...], pool=None)`: runs once per submitted PR tip commit. A named
   pool has capacity one and covers the whole invocation. No pool means no
   pipeline-level concurrency limit.
 - `Build("app", needs=[...])`: builds an app after its dependencies succeed.
@@ -211,10 +218,11 @@ artifacts, and verification of your stated release policy.
 In a retained run directory, you'll find the files below. UI results live under
 `runs/<run-id>/` instead of `state/`, with a separate directory for each run:
 
-- `fixture.json` and `repo/`: revision IDs and Git history.
+- `fixture.json` and `repo/`: PR tip commit IDs and Git history.
 - `state/events.jsonl`: build/release events, cache keys, and cache hits.
 - `state/cache/`: completed cached builds.
-- `state/artifacts/<revision>/`: artifacts for each revision.
+- `state/artifacts/<revision>/`: artifacts for each PR tip SHA. The underlying
+  API and event records call this commit identity `revision`.
 - `state/registry/images/`: image records indexed by immutable content digest.
 - `state/registry/tags/`: published tag pointers.
 - `state/release.json`: the current release, expected artifacts, and resolved images.

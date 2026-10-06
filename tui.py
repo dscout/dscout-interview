@@ -10,11 +10,22 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, DataTable, Footer, RichLog, Static
+from textual.widgets import Button, Checkbox, DataTable, Footer, Static, TextArea
 
 from exercise import execute, load_pipeline
 from flow import live_flow
 from simulation import APPS
+
+
+class EventLog(TextArea):
+    def __init__(self, **kwargs):
+        super().__init__(read_only=True, **kwargs)
+
+    def write(self, message):
+        follow = self.scroll_y >= self.max_scroll_y and not self.selected_text
+        self.insert(f"{message}\n", self.document.end)
+        if follow:
+            self.scroll_end(animate=False)
 
 
 class Welcome(ModalScreen):
@@ -41,20 +52,22 @@ class Welcome(ModalScreen):
             with VerticalScroll(id="welcome-content"):
                 yield Static(
                     "A monorepo with three apps: zorch, greeb, and blerg.\n"
-                    "Git commits are submitted to the pipeline, like CI.\n\n"
+                    "Merged PRs trigger builds and deployments, like CI.\n\n"
                     "Your task: edit the declaration in pipeline.py so builds across\n"
-                    "revisions overlap, while keeping deployments one at a time.\n\n"
+                    "PRs overlap, while keeping deployments one at a time.\n\n"
+                    "Each simulated PR is represented by one tip commit;\n"
+                    "no real Git work is required. No PRs are actually merged.\n"
                     "Releases are local and simulated: no actual deployment,\n"
                     "and nothing changes in your checkout.\n\n"
-                    + ("Run existing history submits the saved Git history."
+                    + ("Run saved PRs submits the saved simulated PR history."
                        if self.existing_history else
-                       "The example submits initial sources, a greeb change,\n"
+                       "The example submits 3 PRs: initial sources, a greeb change,\n"
                        "then a zorch change.")
                 )
             with Horizontal(id="welcome-actions"):
-                yield Button("Run existing history" if self.existing_history else "Run example",
+                yield Button("Run saved PRs" if self.existing_history else "Run example (3 PRs)",
                              variant="primary", id="run-example")
-                yield Button("Choose changes", id="choose-changes")
+                yield Button("Choose PR changes", id="choose-changes")
                 yield Button("Quit", id="welcome-quit")
 
     def on_mount(self) -> None:
@@ -97,18 +110,21 @@ class NewChanges(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="changes-dialog"):
-            yield Static("New simulated changes", id="changes-title")
-            yield Static("Check a box to simulate Git changes for that app in the monorepo.\n"
-                         "The selected apps will change together in one new commit.\n\n"
-                         "Queue commit lets you prepare another commit before running.\n"
-                         "Run pipeline submits queued commits and any checked changes.")
+            yield Static("New simulated PRs", id="changes-title")
+            yield Static("Check a box to include changes for that app in a simulated PR.\n"
+                         "The selected apps will change together in one PR.\n"
+                         "Each simulated PR is represented by one tip commit;\n"
+                         "no real Git work is required. No PRs are actually merged.\n\n"
+                         "Queue PR lets you prepare another PR before running.\n"
+                         "Run pipeline simulates merged PRs triggering builds and deployments\n"
+                         "for queued PRs and any checked changes.")
             for app in APPS:
                 yield SourceCheckbox(app, id=f"change-{app}")
             yield Static(id="selection-summary", markup=False)
-            yield Button("Queue example (3 commits)", id="queue-example")
-            yield Static("No commits queued", id="batch-summary", markup=False)
+            yield Button("Queue example (3 PRs)", id="queue-example")
+            yield Static("No PRs queued", id="batch-summary", markup=False)
             with Horizontal(id="changes-actions"):
-                yield Button("Queue commit", id="queue-commit")
+                yield Button("Queue PR", id="queue-commit")
                 yield Button("Run pipeline", variant="primary", id="run-pipeline")
                 yield Button("Cancel", id="cancel")
 
@@ -121,7 +137,7 @@ class NewChanges(ModalScreen):
     def _update_selection(self) -> None:
         selected = self._selected()
         self.query_one("#selection-summary", Static).update(
-            f"Next commit: {', '.join(selected) or 'no source changes (empty commit)'}"
+            f"Next PR: {', '.join(selected) or 'no source changes'}"
         )
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
@@ -136,8 +152,8 @@ class NewChanges(ModalScreen):
 
     def _update_queue(self) -> None:
         self.query_one("#batch-summary", Static).update(
-            "Queued commits:\n" + "\n".join(
-                f"{index}. {', '.join(change) or 'none (empty commit)'}"
+            "Queued PRs:\n" + "\n".join(
+                f"{index}. {', '.join(change) or 'no source changes'}"
                 for index, change in enumerate(self.batch, 1)
             )
         )
@@ -171,8 +187,9 @@ class BuildApp(App):
     """
     BINDINGS = [
         Binding("r", "rerun", "Rerun"),
-        Binding("n", "new_changes", "New changes"),
-        Binding("q,ctrl+c", "safe_quit", "Quit", priority=True),
+        Binding("n", "new_changes", "New PRs"),
+        Binding("q", "safe_quit", "Quit", priority=True),
+        Binding("ctrl+c", "copy_or_quit", "Copy / quit", priority=True),
     ]
 
     def __init__(self, directory: Path, speed: float):
@@ -200,7 +217,7 @@ class BuildApp(App):
         yield Static(str(self.directory), id="path", markup=False)
         yield DataTable(id="revisions")
         with Horizontal(id="details"):
-            yield RichLog(id="events", markup=False)
+            yield EventLog(id="events")
             with VerticalScroll(id="flow-pane"):
                 yield Static("Run a pipeline to see its flow", id="flow", markup=False)
         yield Footer()
@@ -208,10 +225,10 @@ class BuildApp(App):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         for column in ("Revision", *APPS, "release", "Duration", "Accum Duration"):
-            table.add_column(column, key=column)
+            table.add_column("PR (tip SHA)" if column == "Revision" else column, key=column)
         table.cursor_type = "row"
-        self.query_one("#events", RichLog).border_title = "Event log"
-        self.query_one("#flow-pane").border_title = "Flow · select a commit above"
+        self.query_one("#events", EventLog).border_title = "Event log · select text, Ctrl+C to copy"
+        self.query_one("#flow-pane").border_title = "Flow · select a PR above"
         self._status_timer = self.set_interval(0.1, self._update_status)
         self._show_welcome()
 
@@ -241,7 +258,7 @@ class BuildApp(App):
         self._execution_starts.clear()
         self._run_event_start = None
         self.query_one(DataTable).clear()
-        self.query_one(RichLog).clear()
+        self.query_one(EventLog).clear()
         self.query_one("#path", Static).update(f"Run directory: {self.directory}")
         self._update_status()
         options = {}
@@ -277,7 +294,7 @@ class BuildApp(App):
                           "—", "—", key=revision)
         self._selected_commit = self._last_revisions[0] if self._last_revisions else None
         self._refresh_flow()
-        self.query_one(RichLog).write(f"Revisions ready: {len(self._last_revisions)}")
+        self.query_one(EventLog).write(f"PRs ready: {len(self._last_revisions)}")
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._selected_commit = str(event.row_key.value)
@@ -353,7 +370,7 @@ class BuildApp(App):
             self.failed = True
         hit = f" cache_hit={event['cache_hit']}" if "cache_hit" in event else ""
         task = event.get("app", event.get("task", ""))
-        self.query_one(RichLog).write(f"{revision[:12]} {kind} {task}{hit}")
+        self.query_one(EventLog).write(f"{revision[:12]} {kind} {task}{hit}")
 
     def _result(self, simulation) -> None:
         self.simulation = simulation
@@ -361,14 +378,14 @@ class BuildApp(App):
     def _record_error(self, error) -> None:
         self.failed = True
         self._error = f"{type(error).__name__}: {error}"
-        self.query_one(RichLog).write(f"FAILED: {self._error}")
+        self.query_one(EventLog).write(f"FAILED: {self._error}")
 
     async def _finish(self) -> None:
         await asyncio.to_thread(self._thread.join)
         self.running = False
         self._ended = monotonic()
         if not self.failed:
-            self.query_one(RichLog).write(f"Finished. Release: {self.simulation.state / 'release.json'}")
+            self.query_one(EventLog).write(f"Finished. Release: {self.simulation.state / 'release.json'}")
         self._update_status()
 
     def _update_status(self) -> None:
@@ -377,13 +394,13 @@ class BuildApp(App):
         elapsed = (self._ended or monotonic()) - self._started
         state = "Running" if self.running else "FAILED" if self.failed else "Finished"
         detail = self._error or ("Wait for completion before rerunning or quitting." if self.running
-                                 else "r: rerun · n: new changes · q: quit")
+                                 else "r: rerun · n: new PRs · q: quit")
         self._status.update(f"{state} · {elapsed:.2f}s\n{detail}")
 
     def _busy(self) -> bool:
         if not self.running:
             return False
-        self.query_one(RichLog).write("Still running: must finish before rerunning or quitting.")
+        self.query_one(EventLog).write("Still running: must finish before rerunning or quitting.")
         return True
 
     def action_rerun(self) -> None:
@@ -400,6 +417,12 @@ class BuildApp(App):
             self._start(changes=changes)
         elif self._started is None:
             self._show_welcome()
+
+    def action_copy_or_quit(self) -> None:
+        if isinstance(self.focused, EventLog) and self.focused.selected_text:
+            self.focused.action_copy()
+        else:
+            self.action_safe_quit()
 
     def action_safe_quit(self) -> None:
         if not self._busy():

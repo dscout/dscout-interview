@@ -196,7 +196,11 @@ class ExerciseTests(unittest.TestCase):
             result = subprocess.run(command, check=True, capture_output=True,
                                     text=True, cwd=self.root)
             self.assertIn(f"Fixture: {directory.resolve()}", result.stdout)
-            self.assertIn("Revision: ", result.stdout)
+            history = json.loads((directory / "fixture.json").read_text())["revisions"]
+            tips = [line.removeprefix("PR tip: ") for line in result.stdout.splitlines()
+                    if line.startswith("PR tip: ")]
+            self.assertEqual(tips, history)
+            self.assertNotIn("Revision: ", result.stdout)
             self.assertIn("build_finished", result.stdout)
             self.assertIn("pipeline_started", result.stdout)
             self.assertIn("pipeline_finished", result.stdout)

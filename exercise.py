@@ -68,7 +68,7 @@ def execute(directory, speed, *, observer=None, on_ready=None, changes=None,
     if observer is None:
         print(f"Fixture: {directory}", flush=True)
         for revision in revisions:
-            print(f"Revision: {revision}", flush=True)
+            print(f"PR tip: {revision}", flush=True)
 
     def show(event):
         app = event.get("app", event.get("task", ""))

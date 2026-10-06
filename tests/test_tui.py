@@ -8,12 +8,12 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from textual.widgets import Button, Checkbox, DataTable, RichLog, Static
+from textual.widgets import Button, Checkbox, DataTable, Static
 
 from exercise import execute
 from fixture import git
 from simulation import APPS
-from tui import BuildApp, NewChanges, SourceCheckbox, Welcome
+from tui import BuildApp, EventLog, NewChanges, SourceCheckbox, Welcome
 from workflow import Build, Deploy, Pipeline
 
 
@@ -51,14 +51,16 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(80, 24)) as pilot:
                 self.assertIsInstance(app.screen, Welcome)
                 button = app.screen.query_one("#run-example", Button)
-                self.assertEqual(button.label.plain, "Run example")
+                self.assertEqual(button.label.plain, "Run example (3 PRs)")
                 self.assertIs(app.focused, button)
                 self.assertTrue(button.visible)
                 self.assertGreater(button.region.width, 0)
                 self.assertLessEqual(button.region.bottom, 24)
                 instructions = "\n".join(str(widget.render()) for widget in app.screen.query(Static))
                 for text in ("zorch, greeb, and blerg", "like CI", "pipeline.py",
-                             "revisions overlap", "deployments one at a time",
+                             "Merged PRs trigger builds and deployments", "PRs overlap",
+                             "deployments one at a time", "one tip commit",
+                             "no real Git work is required", "No PRs are actually merged",
                              "local and simulated", "no actual deployment",
                              "nothing changes in your checkout", "initial sources",
                              "greeb change", "zorch change"):
@@ -139,9 +141,9 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 self.assertIsInstance(app.screen, Welcome)
                 button = app.screen.query_one("#run-example", Button)
-                self.assertEqual(button.label.plain, "Run existing history")
+                self.assertEqual(button.label.plain, "Run saved PRs")
                 instructions = "\n".join(str(widget.render()) for widget in app.screen.query(Static))
-                self.assertIn("saved Git history", instructions)
+                self.assertIn("saved simulated PR history", instructions)
                 self.assertNotIn("completed cache", instructions)
                 self.assertNotIn("initial sources", instructions)
                 mocked.assert_not_called()
@@ -158,8 +160,12 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             await self.finished(app, pilot)
             self.assertFalse(app.failed)
             self.assertIsNotNone(app.simulation)
-            self.assertEqual(app.query_one(DataTable).row_count, 3)
+            table = app.query_one(DataTable)
+            self.assertEqual(table.row_count, 3)
+            self.assertEqual(table.columns[next(iter(table.columns))].label.plain, "PR (tip SHA)")
+            self.assertEqual(app.query_one("#flow-pane").border_title, "Flow · select a PR above")
             for revision in app.states:
+                self.assertEqual(table.get_cell(revision, "Revision"), revision[:12])
                 events = [event for event in app.simulation.events()
                           if event["revision"] == revision]
                 finish = max(event["time"] for event in events)
@@ -182,8 +188,16 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([[first_hits[revision, name] for name in APPS]
                               for revision in app._last_revisions],
                              [[False, False, False], [True, False, False], [False, True, True]])
-            log = "\n".join(line.text for line in app.query_one(RichLog).lines)
+            log = app.query_one(EventLog).text
             self.assertIn(str(first.state / "release.json"), log)
+            self.assertIn("PRs ready: 3", log)
+            self.assertNotIn("Revisions ready", log)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            selected = app._last_revisions[0]
+            self.assertEqual(app._selected_commit, selected)
+            self.assertIn(f"PR (tip SHA): {selected[:12]}",
+                          str(app.query_one("#flow", Static).render()))
             await pilot.press("r")
             await self.finished(app, pilot)
             builds = [event for event in app.simulation.events()
@@ -195,6 +209,54 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.simulation.state.parent, self.directory / "runs")
             self.assertTrue(first.state.exists())
             self.assertEqual(first.events(), first_events)
+
+    async def test_event_log_copy_read_only_selection_and_scroll_follow(self):
+        app = BuildApp(self.directory, 0)
+        async with app.run_test(size=(120, 30)) as pilot:
+            app.pop_screen()
+            log = app.query_one(EventLog)
+            self.assertTrue(log.read_only)
+            log.focus()
+            for index in range(40):
+                log.write(f"Event {index}")
+            await pilot.pause()
+            self.assertGreater(log.max_scroll_y, 0)
+            self.assertEqual(log.scroll_y, log.max_scroll_y)
+
+            log.write("Selected event")
+            await pilot.pause()
+            self.assertEqual(log.scroll_y, log.max_scroll_y)
+            log.move_cursor((40, 0))
+            await pilot.press("shift+end")
+            self.assertEqual(log.selected_text, "Selected event")
+            await pilot.press("ctrl+c")
+            self.assertTrue(app.is_running)
+            self.assertEqual(app.clipboard, "Selected event")
+
+            scroll_y = log.scroll_y
+            log.write("Another event")
+            await pilot.pause()
+            self.assertEqual(log.selected_text, "Selected event")
+            self.assertEqual(log.scroll_y, scroll_y)
+            self.assertLess(log.scroll_y, log.max_scroll_y)
+            self.assertTrue(log.text.endswith("Selected event\nAnother event\n"))
+            text = log.text
+            await pilot.press("x", "backspace", "delete", "ctrl+v")
+            self.assertEqual(log.text, text)
+
+            await pilot.press("right")
+            self.assertFalse(log.selected_text)
+            log.move_cursor((0, 0))
+            log.scroll_home(animate=False)
+            await pilot.pause()
+            log.write("While scrolled up")
+            await pilot.pause()
+            self.assertEqual(log.scroll_y, 0)
+            log.scroll_end(animate=False)
+            await pilot.pause()
+            log.write("Following again")
+            await pilot.pause()
+            self.assertEqual(log.scroll_y, log.max_scroll_y)
 
     async def test_new_changes_cancel_and_escape_preserve_run(self):
         app = BuildApp(self.directory, 0)
@@ -243,18 +305,20 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             modal = app.screen
             self.assertIsInstance(modal, NewChanges)
             self.assertEqual(modal.query_one("#queue-commit", Button).label.plain,
-                             "Queue commit")
+                             "Queue PR")
             self.assertEqual(modal.query_one("#run-pipeline", Button).label.plain,
                              "Run pipeline")
             instructions = "\n".join(str(widget.render()) for widget in modal.query(Static))
-            self.assertIn("Check a box to simulate Git changes for that app in the monorepo.",
-                          instructions)
-            self.assertIn("The selected apps will change together in one new commit.",
-                          instructions)
-            self.assertIn("Queue commit lets you prepare another commit before running.",
-                          instructions)
-            self.assertIn("Run pipeline submits queued commits and any checked changes.",
-                          instructions)
+            for text in ("Check a box to include changes for that app in a simulated PR.",
+                         "The selected apps will change together in one PR.",
+                         "one tip commit", "no real Git work is required",
+                         "No PRs are actually merged",
+                         "Queue PR lets you prepare another PR before running.",
+                         "Run pipeline simulates merged PRs triggering builds and deployments",
+                         "for queued PRs and any checked changes.", "No PRs queued",
+                         "Next PR: no source changes"):
+                self.assertIn(text, instructions)
+            self.assertNotIn("Queue commit", instructions)
             self.assertNotIn("invalidat", instructions.lower())
             checkbox = modal.query_one("#change-greeb", SourceCheckbox)
             self.assertFalse(checkbox.value)
@@ -284,7 +348,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1. zorch", str(app.screen.query_one("#batch-summary", Static).render()))
             await pilot.click("#change-greeb")
             summary = str(app.screen.query_one("#selection-summary", Static).render())
-            self.assertIn("Next commit: greeb", summary)
+            self.assertIn("Next PR: greeb", summary)
             self.assertNotIn("invalidat", summary.lower())
             self.assertFalse(app.screen.query_one("#change-blerg", Checkbox).value)
             await pilot.click("#run-pipeline")
@@ -330,11 +394,11 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(original_cache)
                 await pilot.press("n")
                 button = app.screen.query_one("#queue-example", Button)
-                self.assertEqual(button.label.plain, "Queue example (3 commits)")
+                self.assertEqual(button.label.plain, "Queue example (3 PRs)")
                 await pilot.click("#queue-example")
                 self.assertEqual(app.screen.batch, [[], ["greeb"], ["zorch"]])
                 summary = str(app.screen.query_one("#batch-summary", Static).render())
-                for text in ("1. none (empty commit)", "2. greeb", "3. zorch"):
+                for text in ("Queued PRs:", "1. no source changes", "2. greeb", "3. zorch"):
                     self.assertIn(text, summary)
                 self.assertEqual(mocked.call_count, 1)
                 await pilot.click("#run-pipeline")
@@ -469,7 +533,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             app._observe(dict(revision=revision, kind="pipeline_failed", pipeline="builds"))
             self.assertTrue(app.failed)
             self.assertEqual(app.states[revision], blocked)
-            log = "\n".join(line.text for line in app.query_one(RichLog).lines)
+            log = app.query_one(EventLog).text
             self.assertIn("task_blocked blerg", log)
             self.assertIn("pipeline_failed", log)
 
@@ -532,7 +596,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await self.finished(app, pilot)
                 self.assertTrue(app.failed)
                 self.assertIn("SyntaxError", str(app.query_one("#status", Static).render()))
-                log = "\n".join(line.text for line in app.query_one(RichLog).lines)
+                log = app.query_one(EventLog).text
                 self.assertIn("SyntaxError", log)
                 self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
                 self.assertEqual(git(self.directory / "repo", "rev-parse", "HEAD"), head)
@@ -556,7 +620,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await self.finished(app, pilot)
                 self.assertTrue(app.failed)
                 self.assertIn("broken fixture", str(app.query_one("#status", Static).render()))
-                self.assertTrue(app.query_one(RichLog).lines)
+                self.assertTrue(app.query_one(EventLog).text)
                 with patch("tui.execute", execute):
                     await pilot.press("r")
                     await self.finished(app, pilot)

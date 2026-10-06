@@ -166,7 +166,7 @@ def live_flow(pipeline, states, commit=None):
                                       centered(statuses[name]), "".join(bottom))):
             box_rows[left, y + offset] = (row, styles[name])
     output = Text()
-    output.append(f"Commit: {commit[:12] if commit else 'select a commit'}\n", style="bold")
+    output.append(f"PR (tip SHA): {commit[:12] if commit else 'select a PR'}\n", style="bold")
     output.append(f"Pool: {pipeline.pool or 'none'}\n\n", style="dim")
     if positions:
         left = min([x - width // 2 for x, y in positions.values()] + [x for x, y in grid])
