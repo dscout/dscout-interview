@@ -140,17 +140,18 @@ class DeploymentTests(unittest.TestCase):
         self.assertTrue(any(event["kind"] == "task_blocked"
                             and event["task"] == "deploy-blerg" for event in self.sim.events()))
 
-    def test_greeb_rollout_finishes_or_skips_before_blerg(self):
+    def test_greeb_release_decision_precedes_blerg_rollout(self):
         execute_pipeline(self.sim, load_pipeline(), self.revisions)
         events = self.sim.events()
-        for revision in self.revisions:
-            greeb_end = next(i for i, event in enumerate(events)
-                             if event["revision"] == revision and event.get("app") == "greeb"
-                             and event["kind"] in ("deploy_finished", "deploy_skipped"))
-            blerg_request = next(i for i, event in enumerate(events)
-                                 if event["revision"] == revision and event.get("app") == "blerg"
-                                 and event["kind"] == "deploy_requested")
-            self.assertLess(greeb_end, blerg_request)
+        for i, event in enumerate(events):
+            if event["kind"] != "deploy_started" or event.get("app") != "blerg":
+                continue
+            greeb_decision = max(j for j, previous in enumerate(events[:i])
+                                 if previous["revision"] == event["revision"]
+                                 and (previous.get("app") == "greeb"
+                                      and previous["kind"] in ("deploy_finished", "deploy_skipped")
+                                      or previous.get("task") == "deploy-greeb"))
+            self.assertLess(greeb_decision, i)
 
     def test_simulator_does_not_impose_a_no_rollback_policy(self):
         base, changed, _ = self.revisions

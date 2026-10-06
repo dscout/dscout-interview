@@ -253,3 +253,30 @@ In a retained run directory, you'll find the files below. UI results live under
 
 This is a small simulation, not production CI. It doesn't compile real apps or
 model deployment rollback or recovery from machine crashes.
+
+## Candidate write-up
+
+`pipeline.py` removes the top-level capacity-one pool so PR builds overlap, keeps
+`blerg` dependent on its own `greeb` build, and gives each app rollout a shared
+capacity-one deployment pool. Deployments use immutable image digests. Inside
+that pool, the release condition skips an app when the same image is already
+live or when a newer descendant commit is deployed. `blerg` also waits until its
+`greeb` dependency is live; a failed `greeb` rollout blocks `blerg`, but does not
+block independent `zorch` work. This favors forward-only releases and avoids an
+older, slower PR rolling an app back after a newer PR has deployed. Rollouts are
+still per-app, so a failure can leave the environment mixed.
+
+With the README's three-PR fixture at `--speed 5`, one local timing run took
+17.81 seconds with the starter pipeline and 7.45 seconds with this pipeline
+(about 2.4x faster). This is a single simulated run, not a benchmark guarantee.
+
+`tests/test_pipeline.py` checks build overlap with a synchronization barrier,
+verifies deployments never overlap and that `blerg` waits for `greeb`, and
+forces an older PR's builds to finish after a newer PR deploys to check that
+stale releases do not roll back live images. The existing suite checks the
+simulator and executor mechanics. These tests do not establish production
+behavior, process-wide locking across separate runs, or robustness to crashes.
+
+AI agent assistance was used to inspect the exercise, implement the pipeline and
+tests, and run checks. The result was reviewed against the exercise requirements;
+the reported timing and test results come from local runs.
