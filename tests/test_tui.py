@@ -162,10 +162,15 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             for revision in app.states:
                 events = [event for event in app.simulation.events()
                           if event["revision"] == revision]
-                duration = max(event["time"] for event in events) - min(
-                    event["time"] for event in events)
+                finish = max(event["time"] for event in events)
+                start = min(event["time"] for event in events
+                            if event["kind"] == "pipeline_started")
+                duration = finish - start
                 self.assertEqual(app.query_one(DataTable).get_cell(revision, "Duration"),
                                  f"{duration:.2f}s")
+                accumulated = finish - min(event["time"] for event in app.simulation.events())
+                self.assertEqual(app.query_one(DataTable).get_cell(revision, "Accum Duration"),
+                                 f"{accumulated:.2f}s")
             self.assertTrue(all(row["release"] == "finished" for row in app.states.values()))
             status = str(app.query_one("#status", Static).render())
             self.assertIn("Finished", status)

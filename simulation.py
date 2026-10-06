@@ -83,6 +83,89 @@ class Simulation:
     def artifact_path(self, revision, app):
         return self.state / "artifacts" / revision / f"{app}.json"
 
+    def _image_content(self, revision, app):
+        content = {"app": app, "key": self.cache_key(revision, app)}
+        if app == "blerg":
+            content["greeb_key"] = self.cache_key(revision, "greeb")
+        return content
+
+    @staticmethod
+    def _image_digest(content):
+        encoded = json.dumps(["image-v1", content], sort_keys=True).encode()
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    def image_digest(self, revision, app):
+        return self._image_digest(self._image_content(revision, app))
+
+    def image_tag(self, revision, app):
+        if app not in APPS:
+            raise ValueError(f"unknown app: {app}")
+        blob = git(self.repo, "rev-parse", f"{revision}:source/{app}.txt")
+        return f"{app}-{blob}"
+
+    @staticmethod
+    def _validate_reference(reference):
+        if reference not in ("tag", "digest"):
+            raise ValueError(f"unknown image reference: {reference}")
+
+    @staticmethod
+    def _read_registry(path):
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError(f"missing or invalid registry entry: {path}") from error
+
+    def _validate_image(self, record, app, digest):
+        if not isinstance(record, dict):
+            raise ValueError("invalid image record")
+        content = {key: value for key, value in record.items() if key != "digest"}
+        fields = {"app", "key", "greeb_key"} if app == "blerg" else {"app", "key"}
+        keys = [content.get("key")]
+        if app == "blerg":
+            keys.append(content.get("greeb_key"))
+        if (set(content) != fields or content.get("app") != app
+                or any(not isinstance(key, str) or len(key) != 64
+                       or any(char not in "0123456789abcdef" for char in key) for key in keys)
+                or record.get("digest") != digest
+                or self._image_digest(content) != digest):
+            raise ValueError("invalid image record or digest")
+        return record
+
+    def resolve_image(self, revision, app, reference="tag"):
+        self._validate_reference(reference)
+        digest = self.image_digest(revision, app)
+        if reference == "tag":
+            tag = self.image_tag(revision, app)
+            pointer = self._read_registry(self.state / "registry" / "tags" / f"{tag}.json")
+            if not isinstance(pointer, dict) or set(pointer) != {"app", "tag", "digest"}:
+                raise ValueError("invalid image tag")
+            digest = pointer["digest"]
+            if pointer["app"] != app or pointer["tag"] != tag:
+                raise ValueError("invalid image tag")
+        if (not isinstance(digest, str) or not digest.startswith("sha256:")
+                or len(digest) != 71
+                or any(char not in "0123456789abcdef" for char in digest[7:])):
+            raise ValueError("invalid image digest")
+        path = self.state / "registry" / "images" / f"{digest[7:]}.json"
+        return self._validate_image(self._read_registry(path), app, digest)
+
+    def publish_image(self, revision, app):
+        revision = self.resolve(revision)
+        content = self._image_content(revision, app)
+        digest = self._image_digest(content)
+        record = dict(content, digest=digest)
+        path = self.state / "registry" / "images" / f"{digest[7:]}.json"
+        with self.lock(f"image-{digest[7:]}"):
+            if path.exists():
+                self._validate_image(self._read_registry(path), app, digest)
+            else:
+                write_json(path, record)
+        tag = self.image_tag(revision, app)
+        write_json(self.state / "registry" / "tags" / f"{tag}.json",
+                   {"app": app, "tag": tag, "digest": digest})
+        self.event("image_published", revision, app=app, tag=tag, digest=digest)
+        return record
+
     def build(self, revision, app, dependency=None):
         revision = self.resolve(revision)
         key = self.cache_key(revision, app)
@@ -108,6 +191,7 @@ class Simulation:
                     self.event("cache_published", revision, app=app, key=key)
                 artifact = dict(payload, revision=revision)
                 write_json(self.artifact_path(revision, app), artifact)
+            self.publish_image(revision, app)
             self.event("build_finished", revision, app=app, key=key, cache_hit=hit)
             return artifact
         except Exception:
@@ -123,7 +207,8 @@ class Simulation:
         if not path.exists() or json.loads(path.read_text()) != expected:
             raise ValueError(f"missing {app} artifact for {revision}")
 
-    def deploy(self, revision, artifacts):
+    def deploy(self, revision, artifacts, *, image_reference="tag"):
+        self._validate_reference(image_reference)
         revision = self.resolve(revision)
         if set(artifacts) != set(APPS):
             raise ValueError("release requires all three apps")
@@ -132,8 +217,17 @@ class Simulation:
         self.event("deploy_requested", revision)
         self.event("deploy_started", revision)
         time.sleep(0.2 * self.speed)
+        images = {app: self.resolve_image(revision, app, image_reference) for app in APPS}
+        mismatches = {
+            app: {"expected": self.image_digest(revision, app), "actual": image["digest"]}
+            for app, image in images.items()
+            if image["digest"] != self.image_digest(revision, app)
+        }
+        self.event("images_resolved", revision, images=images,
+                   image_reference=image_reference, image_mismatches=mismatches)
         write_json(self.state / "release.json",
-                   {"revision": revision, "artifacts": artifacts})
+                   {"revision": revision, "artifacts": artifacts, "images": images,
+                    "image_reference": image_reference, "image_mismatches": mismatches})
         self.event("deploy_finished", revision)
 
     def events(self):

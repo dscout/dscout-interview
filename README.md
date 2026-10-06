@@ -13,12 +13,13 @@ Work from your fork or a copy of this repo on the
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -B exercise.py
+./run
 .venv/bin/python -B -m unittest discover -s tests -v
 ```
 
 Dependencies stay inside `.venv/`, not your global Python installation. No
-activation is needed; delete `.venv/` to remove them.
+activation is needed; delete `.venv/` to remove them. `./run` uses the checkout's
+virtualenv and forwards arguments to `exercise.py`.
 
 The UI opens with a welcome dialog; nothing runs until you choose.
 **Run example** submits the supplied three-commit scenario, or **Choose changes**
@@ -52,7 +53,7 @@ The default run directory is removed on exit; `--directory` retains it.
 For agents, scripts, or a noninteractive terminal, use plain output:
 
 ```sh
-.venv/bin/python -B exercise.py --plain
+./run --plain
 ```
 
 ## The task
@@ -98,7 +99,7 @@ To keep the history and results, use a fresh directory outside your checkout:
 
 ```sh
 RUN_DIR="$(mktemp -d)"
-.venv/bin/python -B exercise.py --directory "$RUN_DIR"
+./run --directory "$RUN_DIR"
 git -C "$RUN_DIR/repo" log --oneline --stat
 # Use the release path shown in the UI event log:
 python3 -m json.tool "$RUN_DIR/runs/<run-id>/release.json"
@@ -109,9 +110,22 @@ its own results under `runs/`, without reusing earlier runs' cache entries.
 Plain mode uses `state/` and retains its cache across invocations.
 Remove the directory when you're done: `rm -rf "$RUN_DIR"`.
 
-Uncached builds take 0.3 seconds for `zorch` and 0.6 seconds each for `greeb` and
-`blerg`; a release takes 0.2 seconds. `--speed 0` removes delays for quick checks,
-but doesn't prove concurrency correctness.
+At the default delay multiplier (`--speed 5`), uncached builds take 1.5 seconds
+for `zorch` and 3 seconds each for `greeb` and `blerg`; a release takes 1 second.
+Use `--speed 1` for a quicker run or a larger number to slow things down further.
+`--speed 0` removes delays for quick checks, but doesn't prove concurrency correctness.
+
+## Optional type checks
+
+To check the pipeline declaration and executor types:
+
+```sh
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/pyright
+```
+
+Lists and tuples are accepted for `tasks` and `needs`; use square brackets for
+lists, not braces (which create sets). These checks don't verify concurrency.
 
 ## Where to work
 
@@ -166,8 +180,13 @@ that behavior. Atomic writes aren't the same as one deployment at a time.
 
 - `sim.build(revision, app, dependency=None)` returns an artifact. When building
   `blerg`, pass that revision's `greeb` artifact as the dependency.
-- `sim.deploy(revision, artifacts)` takes a dictionary of valid artifacts for all
-  three apps. It checks them and atomically updates the shared release state.
+- `sim.deploy(revision, artifacts, image_reference="tag")` takes valid artifacts
+  for all three apps. It resolves their published images and atomically updates
+  the shared release state. `image_reference` accepts `"tag"` or `"digest"`;
+  the same option is available on `Deploy` declarations.
+- `sim.image_tag(revision, app)` returns the app's source-content tag;
+  `sim.image_digest(revision, app)` returns its expected image content digest.
+- `sim.resolve_image(revision, app, reference="tag")` reads a published image.
 - `sim.lock(name)` provides a shared filesystem lock across threads or local
   processes using the same state directory. Separate state directories represent
   separate environments.
@@ -176,6 +195,16 @@ Build and deploy accept commit IDs from the fixture repo. Cache keys use Git
 source content and a build-version identifier. Changing `greeb` also changes
 `blerg`'s cache inputs. Only successfully published entries can be reused, and
 cache hits still produce artifacts associated with the requested revision.
+
+Builds also publish images to a local file-backed registry, including on cache
+hits. `blerg` incorporates `greeb`'s manifest. Image digests identify their contents;
+tags use the app's own source content and point to the most recently published
+image under that name. Deployment resolves image references after it starts.
+Release output records both the expected build artifacts and the resolved images.
+
+Exploring image publication and resolution is optional additional work. The
+required take-home goals remain build overlap, deployment exclusion, retained
+artifacts, and verification of your stated release policy.
 
 ### Output files
 
@@ -186,7 +215,9 @@ In a retained run directory, you'll find the files below. UI results live under
 - `state/events.jsonl`: build/release events, cache keys, and cache hits.
 - `state/cache/`: completed cached builds.
 - `state/artifacts/<revision>/`: artifacts for each revision.
-- `state/release.json`: the current simulated release.
+- `state/registry/images/`: image records indexed by immutable content digest.
+- `state/registry/tags/`: published tag pointers.
+- `state/release.json`: the current release, expected artifacts, and resolved images.
 
 ### Test hooks
 

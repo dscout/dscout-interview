@@ -2,13 +2,16 @@
 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
+from typing import Callable, Sequence
 import threading
+
+from simulation import Simulation
 
 
 @dataclass(frozen=True)
 class Build:
     name: str
-    needs: tuple = ()
+    needs: Sequence[str] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "needs", tuple(self.needs))
@@ -17,8 +20,9 @@ class Build:
 @dataclass(frozen=True)
 class Deploy:
     name: str
-    needs: tuple = ()
-    when: object = None
+    needs: Sequence[str] = ()
+    when: Callable[[Simulation, str, dict], bool] | None = None
+    image_reference: str = "tag"
 
     def __post_init__(self):
         object.__setattr__(self, "needs", tuple(self.needs))
@@ -28,7 +32,7 @@ class Deploy:
 class Call:
     name: str
     pipeline: "Pipeline"
-    needs: tuple = ()
+    needs: Sequence[str] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "needs", tuple(self.needs))
@@ -36,7 +40,7 @@ class Call:
 
 @dataclass(frozen=True)
 class Pipeline:
-    tasks: tuple = ()
+    tasks: Sequence[Build | Deploy | Call] = ()
     pool: str | None = None
 
     def __post_init__(self):
@@ -74,6 +78,8 @@ def validate(pipeline, ancestors=(), pools=(), pool_edges=None):
                 raise ValueError(f"unknown app: {task.name}")
             if task.name == "blerg" and "greeb" not in task.needs:
                 raise ValueError("blerg must depend on greeb")
+        if isinstance(task, Deploy) and task.image_reference not in ("tag", "digest"):
+            raise ValueError("image_reference must be tag or digest")
         if isinstance(task, Call):
             validate(task.pipeline, ancestors + (id(pipeline),),
                      pools + ((pipeline.pool,) if pipeline.pool else ()), pool_edges)
@@ -156,7 +162,7 @@ class Executor:
             if task.when is not None and not task.when(self.sim, commit, artifacts):
                 self.sim.event("task_skipped", commit, task=task.name)
                 return {}
-            self.sim.deploy(commit, artifacts)
+            self.sim.deploy(commit, artifacts, image_reference=task.image_reference)
             return {}
         return self.invoke(task.pipeline, commit, artifacts)
 

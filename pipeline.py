@@ -2,6 +2,9 @@
 
 from workflow import Build, Deploy, Pipeline
 
+# zorch ---------------------> release
+# greeb --------> blerg ------> release
+# Edges are needs; list order is not execution order.
 pipeline = Pipeline(
     pool="pipeline",
     tasks=[

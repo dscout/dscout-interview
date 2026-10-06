@@ -12,9 +12,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Footer, RichLog, Static
 
-from exercise import execute
-from flow import render_flow
-from pipeline import pipeline
+from exercise import execute, load_pipeline
+from flow import live_flow
 from simulation import APPS
 
 
@@ -164,9 +163,11 @@ class BuildApp(App):
     CSS = """
     #status { height: 2; }
     #path { height: 2; }
-    #flow { height: auto; max-height: 10; overflow-y: auto; border: round $accent; }
     #revisions { height: 8; }
-    #events { height: 1fr; }
+    #details { height: 1fr; }
+    #events { width: 1fr; height: 100%; border: round $accent; }
+    #flow-pane { width: 1fr; height: 100%; border: round $accent; }
+    #flow { height: auto; padding: 1; }
     """
     BINDINGS = [
         Binding("r", "rerun", "Rerun"),
@@ -183,27 +184,34 @@ class BuildApp(App):
         self.simulation = None
         self.states = {}
         self._revision_times = {}
+        self._execution_starts = {}
+        self._run_event_start = None
         self._last_revisions = None
         self._thread = None
         self._error = None
         self._started = None
         self._ended = None
+        self._selected_commit = None
+        self._flow_pipeline = None
 
     def compose(self) -> ComposeResult:
         self._status = Static("Ready to run", id="status", markup=False)
         yield self._status
         yield Static(str(self.directory), id="path", markup=False)
-        yield Static(render_flow(pipeline) + "\nEdges show needs; independent tasks may overlap. "
-                     "Levels are not execution barriers.", id="flow", markup=False)
         yield DataTable(id="revisions")
-        yield RichLog(id="events", markup=False)
+        with Horizontal(id="details"):
+            yield RichLog(id="events", markup=False)
+            with VerticalScroll(id="flow-pane"):
+                yield Static("Run a pipeline to see its flow", id="flow", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        for column in ("Revision", *APPS, "release", "Duration"):
+        for column in ("Revision", *APPS, "release", "Duration", "Accum Duration"):
             table.add_column(column, key=column)
-        table.cursor_type = "none"
+        table.cursor_type = "row"
+        self.query_one("#events", RichLog).border_title = "Event log"
+        self.query_one("#flow-pane").border_title = "Flow · select a commit above"
         self._status_timer = self.set_interval(0.1, self._update_status)
         self._show_welcome()
 
@@ -224,7 +232,14 @@ class BuildApp(App):
         self._started = monotonic()
         self._ended = None
         self.states.clear()
+        self._selected_commit = None
+        try:
+            self._flow_pipeline = load_pipeline()
+        except Exception:
+            self._flow_pipeline = None
         self._revision_times.clear()
+        self._execution_starts.clear()
+        self._run_event_start = None
         self.query_one(DataTable).clear()
         self.query_one(RichLog).clear()
         self.query_one("#path", Static).update(f"Run directory: {self.directory}")
@@ -259,8 +274,24 @@ class BuildApp(App):
         for revision in self._last_revisions:
             self.states[revision] = dict.fromkeys((*APPS, "release"), "pending")
             table.add_row(revision[:12], *(Text("pending", style="dim") for _ in range(4)),
-                          "—", key=revision)
+                          "—", "—", key=revision)
+        self._selected_commit = self._last_revisions[0] if self._last_revisions else None
+        self._refresh_flow()
         self.query_one(RichLog).write(f"Revisions ready: {len(self._last_revisions)}")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._selected_commit = str(event.row_key.value)
+        self._refresh_flow()
+
+    def _refresh_flow(self) -> None:
+        if self._flow_pipeline is not None:
+            try:
+                content = live_flow(self._flow_pipeline,
+                                    self.states.get(self._selected_commit, {}),
+                                    self._selected_commit)
+            except ValueError as error:
+                content = Text(str(error), style="red")
+            self.query_one("#flow", Static).update(content)
 
     def _observe(self, event) -> None:
         revision, kind = event["revision"], event["kind"]
@@ -268,10 +299,19 @@ class BuildApp(App):
             started, ended = self._revision_times.get(revision, (event["time"], event["time"]))
             started, ended = min(started, event["time"]), max(ended, event["time"])
             self._revision_times[revision] = started, ended
-            self.query_one(DataTable).update_cell(
-                revision, "Duration", f"{ended - started:.2f}s",
-                update_width=True,
-            )
+            self._run_event_start = (started if self._run_event_start is None
+                                     else min(self._run_event_start, started))
+            if kind == "pipeline_started":
+                previous = self._execution_starts.get(revision, event["time"])
+                self._execution_starts[revision] = min(previous, event["time"])
+            execution_start = self._execution_starts.get(revision)
+            table = self.query_one(DataTable)
+            if execution_start is not None:
+                table.update_cell(revision, "Duration", f"{ended - execution_start:.2f}s",
+                                  update_width=True)
+            for commit, (_, finish) in self._revision_times.items():
+                table.update_cell(commit, "Accum Duration",
+                                  f"{finish - self._run_event_start:.2f}s", update_width=True)
         column = event.get("app", "release")
         if kind in ("task_blocked", "task_skipped"):
             task = event["task"]
@@ -297,6 +337,18 @@ class BuildApp(App):
                      "finished (cache hit)": "cached"}.get(status, status)
             self.query_one(DataTable).update_cell(revision, column, Text(label, style=style),
                                                   update_width=True)
+        if revision == self._selected_commit:
+            self._refresh_flow()
+            terminal = {"finished", "finished (cache hit)", "failed", "blocked", "skipped"}
+            if all(state in terminal for state in self.states[revision].values()):
+                for next_commit in self._last_revisions or []:
+                    if next_commit != revision and not all(
+                            state in terminal for state in self.states[next_commit].values()):
+                        self._selected_commit = next_commit
+                        row = self._last_revisions.index(next_commit)
+                        self.query_one(DataTable).move_cursor(row=row)
+                        self._refresh_flow()
+                        break
         if kind.endswith("_failed"):
             self.failed = True
         hit = f" cache_hit={event['cache_hit']}" if "cache_hit" in event else ""

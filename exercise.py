@@ -92,7 +92,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path,
                         help="retain fixture and state here; use a directory outside the checkout")
-    parser.add_argument("--speed", type=float, default=1, help="delay multiplier (default: 1)")
+    parser.add_argument("--speed", type=float, default=5, help="delay multiplier (default: 5)")
     parser.add_argument("--plain", action="store_true", help="run without the terminal UI")
     args = parser.parse_args()
     if not math.isfinite(args.speed) or args.speed < 0:
