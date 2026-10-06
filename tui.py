@@ -40,7 +40,7 @@ class Welcome(ModalScreen):
     #welcome-actions { height: 3; margin-top: 1; }
     #welcome-actions Button { min-width: 10; margin-right: 1; }
     """
-    BINDINGS = [Binding("escape,q,ctrl+c", "quit", "Quit")]
+    BINDINGS = [Binding("escape,q", "quit", "Quit")]
 
     def __init__(self, existing_history: bool):
         super().__init__()
@@ -189,7 +189,6 @@ class BuildApp(App):
         Binding("r", "rerun", "Rerun"),
         Binding("n", "new_changes", "New PRs"),
         Binding("q", "safe_quit", "Quit", priority=True),
-        Binding("ctrl+c", "copy_or_quit", "Copy / quit", priority=True),
     ]
 
     def __init__(self, directory: Path, speed: float):
@@ -227,7 +226,7 @@ class BuildApp(App):
         for column in ("Revision", *APPS, "release", "Duration", "Accum Duration"):
             table.add_column("PR (tip SHA)" if column == "Revision" else column, key=column)
         table.cursor_type = "row"
-        self.query_one("#events", EventLog).border_title = "Event log · select text, Ctrl+C to copy"
+        self.query_one("#events", EventLog).border_title = "Event log"
         self.query_one("#flow-pane").border_title = "Flow · select a PR above"
         self._status_timer = self.set_interval(0.1, self._update_status)
         self._show_welcome()
@@ -417,12 +416,6 @@ class BuildApp(App):
             self._start(changes=changes)
         elif self._started is None:
             self._show_welcome()
-
-    def action_copy_or_quit(self) -> None:
-        if isinstance(self.focused, EventLog) and self.focused.selected_text:
-            self.focused.action_copy()
-        else:
-            self.action_safe_quit()
 
     def action_safe_quit(self) -> None:
         if not self._busy():

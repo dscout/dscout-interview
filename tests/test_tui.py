@@ -119,7 +119,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(app._thread)
 
     async def test_welcome_quit_does_no_work(self):
-        for quit_choice in ("button", "q", "ctrl+c", "escape"):
+        for quit_choice in ("button", "q", "escape"):
             with self.subTest(quit_choice=quit_choice), patch("tui.execute") as mocked:
                 app = BuildApp(self.directory, 0)
                 async with app.run_test() as pilot:

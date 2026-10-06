@@ -27,10 +27,10 @@ lets you prepare your own simulated PRs first. With a retained run directory, th
 first choice becomes **Run saved PRs**, submitting its saved PR tips.
 
 During a run, the UI shows each PR's tip SHA, builds, cache hits, and release
-alongside a live event log and elapsed time. Select log text with the mouse or
-Shift+arrow keys and press **Ctrl+C** to copy it. Clipboard integration depends on
-your terminal supporting OSC 52. The log is read-only; selecting text pauses its
-auto-scroll. After a run, press
+alongside a live event log and elapsed time. Use your terminal's normal selection
+and copy shortcut to copy log output; you may need to hold Shift (or your terminal's
+mouse-bypass modifier) while dragging. The log is read-only; selecting text within
+the log pauses its auto-scroll. After a run, press
 **r** to rerun the last batch, **n** to choose new simulated changes, or **q**
 to quit. These controls are available after the current run finishes.
 
