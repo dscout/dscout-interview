@@ -10,11 +10,11 @@ from unittest.mock import patch
 
 from textual.widgets import Button, Checkbox, DataTable, Static
 
-from exercise import execute
-from fixture import git
-from simulation import APPS
-from tui import BuildApp, EventLog, NewChanges, SourceCheckbox, Welcome
-from workflow import Build, Deploy, Pipeline
+from lib.exercise import execute
+from lib.fixture import git
+from lib.simulation import APPS
+from lib.tui import BuildApp, EventLog, NewChanges, SourceCheckbox, Welcome
+from lib.workflow import Build, Call, Deploy, Pipeline
 
 
 starter_pipeline = Pipeline(
@@ -23,14 +23,22 @@ starter_pipeline = Pipeline(
         Build("zorch"),
         Build("greeb"),
         Build("blerg", needs=["greeb"]),
-        Deploy("release", needs=["zorch", "greeb", "blerg"]),
+        Call("deploy-zorch", needs=["zorch"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-zorch", "zorch")],
+        )),
+        Call("deploy-greeb", needs=["greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-greeb", "greeb")],
+        )),
+        Call("deploy-blerg", needs=["blerg", "deploy-greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-blerg", "blerg")],
+        )),
     ],
 )
 
 
 class TuiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        pipeline_patch = patch("exercise.load_pipeline", return_value=starter_pipeline)
+        pipeline_patch = patch("lib.exercise.load_pipeline", return_value=starter_pipeline)
         self.pipeline_patch = pipeline_patch
         pipeline_patch.start()
         self.addCleanup(pipeline_patch.stop)
@@ -47,7 +55,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_welcome_waits_for_choice_and_primary_is_visible(self):
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute") as mocked:
+        with patch("lib.tui.execute") as mocked:
             async with app.run_test(size=(80, 24)) as pilot:
                 self.assertIsInstance(app.screen, Welcome)
                 button = app.screen.query_one("#run-example", Button)
@@ -79,7 +87,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_choose_changes_first_submits_only_selected_revisions(self):
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute", wraps=execute) as mocked:
+        with patch("lib.tui.execute", wraps=execute) as mocked:
             async with app.run_test(size=(120, 35)) as pilot:
                 await pilot.click("#choose-changes")
                 self.assertIsInstance(app.screen, NewChanges)
@@ -100,7 +108,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_first_changes_returns_welcome_without_work(self):
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute") as mocked:
+        with patch("lib.tui.execute") as mocked:
             async with app.run_test(size=(120, 35)) as pilot:
                 for cancel in ("button", "escape"):
                     await pilot.click("#choose-changes")
@@ -119,8 +127,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(app._thread)
 
     async def test_welcome_quit_does_no_work(self):
-        for quit_choice in ("button", "q", "escape"):
-            with self.subTest(quit_choice=quit_choice), patch("tui.execute") as mocked:
+        for quit_choice in ("button", "q", "escape", "ctrl+c"):
+            with self.subTest(quit_choice=quit_choice), patch("lib.tui.execute") as mocked:
                 app = BuildApp(self.directory, 0)
                 async with app.run_test() as pilot:
                     if quit_choice == "button":
@@ -137,7 +145,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                                 observer=lambda event: None, on_ready=lambda revisions: None)
         manifest = (self.directory / "fixture.json").read_bytes()
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute", wraps=execute) as mocked:
+        with patch("lib.tui.execute", wraps=execute) as mocked:
             async with app.run_test() as pilot:
                 self.assertIsInstance(app.screen, Welcome)
                 button = app.screen.query_one("#run-example", Button)
@@ -189,7 +197,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                               for revision in app._last_revisions],
                              [[False, False, False], [True, False, False], [False, True, True]])
             log = app.query_one(EventLog).text
-            self.assertIn(str(first.state / "release.json"), log)
+            self.assertIn(str(first.state / "deployments"), log)
             self.assertIn("PRs ready: 3", log)
             self.assertNotIn("Revisions ready", log)
             table.move_cursor(row=0)
@@ -210,6 +218,24 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(first.state.exists())
             self.assertEqual(first.events(), first_events)
 
+    async def test_ctrl_c_quits_with_log_focus_but_waits_for_active_run(self):
+        app = BuildApp(self.directory, 0)
+        async with app.run_test(size=(120, 30)) as pilot:
+            app.pop_screen()
+            log = app.query_one(EventLog)
+            log.write("Selected event")
+            log.focus()
+            log.move_cursor((0, 0))
+            await pilot.press("shift+end")
+            self.assertTrue(log.selected_text)
+            app.running = True
+            await pilot.press("ctrl+c")
+            self.assertTrue(app.is_running)
+            self.assertIn("Still running", log.text)
+            app.running = False
+            await pilot.press("ctrl+c")
+            self.assertFalse(app.is_running)
+
     async def test_event_log_copy_read_only_selection_and_scroll_follow(self):
         app = BuildApp(self.directory, 0)
         async with app.run_test(size=(120, 30)) as pilot:
@@ -229,7 +255,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             log.move_cursor((40, 0))
             await pilot.press("shift+end")
             self.assertEqual(log.selected_text, "Selected event")
-            await pilot.press("ctrl+c")
+            log.action_copy()
             self.assertTrue(app.is_running)
             self.assertEqual(app.clipboard, "Selected event")
 
@@ -381,7 +407,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_queue_example_appends_history_and_fresh_rerun(self):
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute", wraps=execute) as mocked:
+        with patch("lib.tui.execute", wraps=execute) as mocked:
             async with app.run_test(size=(120, 35)) as pilot:
                 await pilot.press("enter")
                 await self.finished(app, pilot)
@@ -447,7 +473,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_queue_example_preserves_queued_and_pending_choices(self):
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute", wraps=execute) as mocked:
+        with patch("lib.tui.execute", wraps=execute) as mocked:
             async with app.run_test(size=(120, 35)) as pilot:
                 await pilot.click("#choose-changes")
                 await pilot.click("#change-blerg")
@@ -477,7 +503,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 35)) as pilot:
             await pilot.press("enter")
             await self.finished(app, pilot)
-            with patch("tui.execute", wraps=execute) as mocked:
+            with patch("lib.tui.execute", wraps=execute) as mocked:
                 await pilot.press("n")
                 await pilot.click("#change-blerg")
                 await pilot.click("#queue-commit")
@@ -493,7 +519,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await self.finished(app, pilot)
             history = app._last_revisions.copy()
-            with patch("tui.execute", wraps=execute) as mocked:
+            with patch("lib.tui.execute", wraps=execute) as mocked:
                 await pilot.press("n")
                 await pilot.click("#run-pipeline")
                 await self.finished(app, pilot)
@@ -543,10 +569,12 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
         def edit_pipeline(pool):
             declaration.write_text(
-                "from workflow import Build, Deploy, Pipeline\n"
+                "from lib.workflow import Build, Deploy, Pipeline\n"
                 f"pipeline = Pipeline(pool={pool!r}, tasks=[\n"
                 "    Build('zorch'), Build('greeb'), Build('blerg', needs=['greeb']),\n"
-                "    Deploy('release', needs=['zorch', 'greeb', 'blerg']),\n"
+                "    Deploy('deploy-zorch', 'zorch', needs=['zorch']),\n"
+                "    Deploy('deploy-greeb', 'greeb', needs=['greeb', 'deploy-zorch']),\n"
+                "    Deploy('deploy-blerg', 'blerg', needs=['blerg', 'deploy-greeb']),\n"
                 "])\n"
             )
 
@@ -558,7 +586,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
         edit_pipeline("first")
         app = BuildApp(self.directory, 0)
-        with patch("exercise.PIPELINE_PATH", declaration):
+        with patch("lib.exercise.PIPELINE_PATH", declaration):
             async with app.run_test(size=(120, 35)) as pilot:
                 await pilot.press("enter")
                 await self.finished(app, pilot)
@@ -609,19 +637,19 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((self.directory / "fixture.json").read_bytes(), manifest)
                 self.assertEqual(first.events(), first_events)
                 for simulation in (first, rerun, changed, app.simulation):
-                    self.assertTrue((simulation.state / "release.json").exists())
+                    self.assertTrue((simulation.state / "deployments").exists())
                 self.assertEqual(len(list((self.directory / "runs").iterdir())), 4)
 
     async def test_worker_failure_visible_and_rerunnable(self):
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute", side_effect=RuntimeError("broken fixture")):
+        with patch("lib.tui.execute", side_effect=RuntimeError("broken fixture")):
             async with app.run_test() as pilot:
                 await pilot.press("enter")
                 await self.finished(app, pilot)
                 self.assertTrue(app.failed)
                 self.assertIn("broken fixture", str(app.query_one("#status", Static).render()))
                 self.assertTrue(app.query_one(EventLog).text)
-                with patch("tui.execute", execute):
+                with patch("lib.tui.execute", execute):
                     await pilot.press("r")
                     await self.finished(app, pilot)
                     self.assertFalse(app.failed)
@@ -660,7 +688,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 await pilot.press("enter")
 
-        with patch("tui.execute", side_effect=controlled), patch.object(
+        with patch("lib.tui.execute", side_effect=controlled), patch.object(
             app, "call_from_thread", side_effect=RuntimeError("App is not running")
         ):
             task = asyncio.create_task(run())
@@ -711,7 +739,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test() as pilot:
                 await pilot.press("enter")
                 await self.finished(app, pilot)
-                with patch("tui.execute", side_effect=controlled):
+                with patch("lib.tui.execute", side_effect=controlled):
                     app.action_rerun()
                     run_thread = app._thread
                     self.assertTrue(await asyncio.to_thread(started.wait, 5))
@@ -756,7 +784,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("build failed")
 
         app = BuildApp(self.directory, 0)
-        with patch("tui.execute", side_effect=controlled) as mocked:
+        with patch("lib.tui.execute", side_effect=controlled) as mocked:
             async with app.run_test() as pilot:
                 try:
                     await pilot.press("enter")
@@ -771,7 +799,9 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await self.finished(app, pilot)
                 self.assertTrue(app.failed)
                 self.assertEqual(app.states["revision"], {
-                    "zorch": "cache hit", "greeb": "failed", "blerg": "finished", "release": "failed",
+                    "zorch": "cache hit", "greeb": "failed", "blerg": "finished",
+                    "deploy-zorch": "pending", "deploy-greeb": "pending",
+                    "deploy-blerg": "pending", "release": "failed",
                 })
                 await pilot.press("q")
 

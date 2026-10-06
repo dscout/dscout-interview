@@ -6,9 +6,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from exercise import execute
-from fixture import APPS, add_changes, create_history, git
-from workflow import Build, Deploy, Pipeline
+from lib.exercise import execute
+from lib.fixture import APPS, add_changes, create_history, git
+from lib.workflow import Build, Call, Deploy, Pipeline
 
 
 starter_pipeline = Pipeline(
@@ -17,14 +17,22 @@ starter_pipeline = Pipeline(
         Build("zorch"),
         Build("greeb"),
         Build("blerg", needs=["greeb"]),
-        Deploy("release", needs=["zorch", "greeb", "blerg"]),
+        Call("deploy-zorch", needs=["zorch"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-zorch", "zorch")],
+        )),
+        Call("deploy-greeb", needs=["greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-greeb", "greeb")],
+        )),
+        Call("deploy-blerg", needs=["blerg", "deploy-greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-blerg", "blerg")],
+        )),
     ],
 )
 
 
 class ChangesTests(unittest.TestCase):
     def setUp(self):
-        pipeline_patch = patch("exercise.load_pipeline", return_value=starter_pipeline)
+        pipeline_patch = patch("lib.exercise.load_pipeline", return_value=starter_pipeline)
         pipeline_patch.start()
         self.addCleanup(pipeline_patch.stop)
         temporary = tempfile.TemporaryDirectory()
@@ -73,10 +81,10 @@ class ChangesTests(unittest.TestCase):
                 self.assertEqual(len(builds), 3)
                 self.assertEqual({event["app"] for event in builds if event["cache_hit"]},
                                  set(APPS) - invalidated)
-                release = json.loads((sim.state / "release.json").read_text())
-                self.assertEqual(release["revision"], revision)
                 for app in APPS:
-                    sim.validate_artifact(revision, app, release["artifacts"][app])
+                    deployed = sim.deployed(app)
+                    self.assertEqual(deployed["image"]["digest"], sim.image_digest(revision, app))
+                    sim.validate_artifact(deployed["revision"], app, deployed["artifact"])
 
     def test_batches_append_history_and_replay_without_commits(self):
         sim, initial, _ = self.execute()
@@ -87,7 +95,8 @@ class ChangesTests(unittest.TestCase):
         self.assertEqual(git(sim.repo, "rev-list", "--count", "HEAD"), "6")
         self.assertEqual(git(sim.repo, "show", f"{batch[1]}:source/zorch.txt"), "zorch-v4")
         self.assertEqual([event["revision"] for event in events
-                          if event["kind"] == "deploy_finished"], batch)
+                          if event["kind"] == "pipeline_finished"
+                          and event["pool"] == "pipeline"], batch)
         manifest = (self.root / "fixture.json").read_bytes()
         sim, replay, events = self.execute(revisions=iter(batch))
         self.assertEqual(replay, batch)
@@ -106,14 +115,14 @@ class ChangesTests(unittest.TestCase):
 
     def test_empty_batch_and_empty_replay_do_not_commit_or_build(self):
         sim, initial, _ = self.execute()
-        release = (sim.state / "release.json").read_bytes()
+        release = {app: sim.deployed(app) for app in APPS}
         manifest = (self.root / "fixture.json").read_bytes()
         for kwargs in ({"changes": []}, {"revisions": []}):
             with self.subTest(kwargs=kwargs):
                 sim, batch, events = self.execute(**kwargs)
                 self.assertEqual(batch, [])
                 self.assertEqual(events, [])
-                self.assertEqual((sim.state / "release.json").read_bytes(), release)
+                self.assertEqual({app: sim.deployed(app) for app in APPS}, release)
                 self.assertEqual((self.root / "fixture.json").read_bytes(), manifest)
                 self.assertEqual(git(sim.repo, "rev-parse", "HEAD"), initial[-1])
 

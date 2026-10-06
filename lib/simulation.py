@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import time
 
-from fixture import git
+from lib.fixture import git
 
 APPS = ("zorch", "greeb", "blerg")
 BUILD_SECONDS = {"zorch": 0.3, "greeb": 0.6, "blerg": 0.6}
@@ -44,10 +44,12 @@ class Simulation:
     """Shared state lives in state_dir; observer(event) runs after each logged event.
 
     speed scales delays (0 removes them). fail_build(revision, app) may return
-    True to simulate a failed cache miss. Callbacks may block or raise for tests.
+    True to simulate a failed cache miss. fail_deploy(revision, app) may fail
+    a rollout before publishing deployed state. Callbacks may block or raise.
     """
 
-    def __init__(self, repo, state_dir, *, speed=1, observer=None, fail_build=None):
+    def __init__(self, repo, state_dir, *, speed=1, observer=None, fail_build=None,
+                 fail_deploy=None):
         if speed < 0:
             raise ValueError("speed must be nonnegative")
         self.repo = Path(repo)
@@ -56,6 +58,7 @@ class Simulation:
         self.speed = speed
         self.observer = observer
         self.fail_build = fail_build
+        self.fail_deploy = fail_deploy
 
     def lock(self, name):
         return file_lock(self.state / "locks" / f"{name}.lock")
@@ -207,28 +210,39 @@ class Simulation:
         if not path.exists() or json.loads(path.read_text()) != expected:
             raise ValueError(f"missing {app} artifact for {revision}")
 
-    def deploy(self, revision, artifacts, *, image_reference="tag"):
+    def deployed(self, app):
+        if app not in APPS:
+            raise ValueError(f"unknown app: {app}")
+        path = self.state / "deployments" / f"{app}.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def deploy(self, revision, app, artifact, *, image_reference="tag"):
         self._validate_reference(image_reference)
         revision = self.resolve(revision)
-        if set(artifacts) != set(APPS):
-            raise ValueError("release requires all three apps")
-        for app in APPS:
-            self.validate_artifact(revision, app, artifacts[app])
-        self.event("deploy_requested", revision)
-        self.event("deploy_started", revision)
-        time.sleep(0.2 * self.speed)
-        images = {app: self.resolve_image(revision, app, image_reference) for app in APPS}
-        mismatches = {
-            app: {"expected": self.image_digest(revision, app), "actual": image["digest"]}
-            for app, image in images.items()
-            if image["digest"] != self.image_digest(revision, app)
-        }
-        self.event("images_resolved", revision, images=images,
-                   image_reference=image_reference, image_mismatches=mismatches)
-        write_json(self.state / "release.json",
-                   {"revision": revision, "artifacts": artifacts, "images": images,
-                    "image_reference": image_reference, "image_mismatches": mismatches})
-        self.event("deploy_finished", revision)
+        self.validate_artifact(revision, app, artifact)
+        self.event("deploy_requested", revision, app=app)
+        try:
+            expected = self.image_digest(revision, app)
+            current = self.deployed(app)
+            if current and current["image"]["digest"] == expected:
+                self.event("deploy_skipped", revision, app=app, reason="already deployed")
+                return
+            self.event("deploy_started", revision, app=app)
+            time.sleep(0.2 * self.speed)
+            image = self.resolve_image(revision, app, image_reference)
+            mismatch = ({"expected": expected, "actual": image["digest"]}
+                        if image["digest"] != expected else {})
+            self.event("image_resolved", revision, app=app, image=image,
+                       image_reference=image_reference, image_mismatch=mismatch)
+            if self.fail_deploy and self.fail_deploy(revision, app):
+                raise RuntimeError(f"simulated deployment failure: {app}")
+            write_json(self.state / "deployments" / f"{app}.json",
+                       {"revision": revision, "artifact": artifact, "image": image,
+                        "image_reference": image_reference, "image_mismatch": mismatch})
+            self.event("deploy_finished", revision, app=app)
+        except Exception:
+            self.event("deploy_failed", revision, app=app)
+            raise
 
     def events(self):
         with self.lock("events"):

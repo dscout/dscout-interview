@@ -1,6 +1,6 @@
 """Text view of declared dependencies, independent of task list order."""
 
-from workflow import Call, validate
+from lib.workflow import Build, Call, Deploy, validate
 
 
 def flow_levels(pipeline):
@@ -17,29 +17,47 @@ def flow_levels(pipeline):
     return levels
 
 
+def task_app(task):
+    if isinstance(task, Build):
+        return task.name
+    if isinstance(task, Deploy):
+        return task.app
+    apps = {task_app(child) for child in task.pipeline.tasks} - {None}
+    return next(iter(apps)) if len(apps) == 1 else None
+
+
 def flow_layout(pipeline, width=20):
     levels = flow_levels(pipeline)
-    positions = {}
     edges = [(parent, task.name) for level in levels for task in level
              for parent in dict.fromkeys(task.needs)]
-    ranks = {task.name: rank for rank, level in enumerate(levels) for task in level}
-    y = 0
+    lanes = {}
+    for level in levels:
+        for task in level:
+            app = task_app(task)
+            if app is not None and app not in lanes:
+                lanes[app] = len(lanes)
+    positions = {}
     for rank, level in enumerate(levels):
-        desired = {}
-        for index, task in enumerate(level):
-            parents = {positions[name][0] for name in task.needs}
-            desired[task.name] = (2 * round(sum(parents) / len(parents) / 2) if parents
-                                  else 2 * (width // 4) + index * (width + 6))
-        occupied = []
-        for task in sorted(level, key=lambda task: desired[task.name]):
-            center = desired[task.name]
-            while any(abs(center - other) < width + 6 for other in occupied):
-                center += width + 6
-            positions[task.name] = (center, y)
-            occupied.append(center)
-        touching = [edge for edge in edges
-                    if ranks[edge[0]] == rank or ranks[edge[1]] == rank + 1]
-        y += 4 + max(3, len(touching) + 1)
+        occupied = set()
+        for task in level:
+            app = task_app(task)
+            lane = lanes.get(app)
+            if lane is None:
+                lane = (positions[task.needs[0]][0] - width // 2) // (width + 6) if task.needs else 0
+            while lane in occupied:
+                lane += 1
+            occupied.add(lane)
+            positions[task.name] = (width // 2 + lane * (width + 6), rank)
+    y = 0
+    ranks = {name: rank for name, (_, rank) in positions.items()}
+    for rank, level in enumerate(levels):
+        for task in level:
+            positions[task.name] = (positions[task.name][0], y)
+        routed = [edge for edge in edges
+                  if ranks[edge[0]] <= rank < ranks[edge[1]]
+                  and (positions[edge[0]][0] != positions[edge[1]][0]
+                       or ranks[edge[1]] - ranks[edge[0]] > 1)]
+        y += 4 + max(3, len(routed) + 2)
     return positions, edges
 
 
@@ -55,7 +73,7 @@ def live_flow(pipeline, states, commit=None):
         for task in level:
             status = states.get(task.name, "pending")
             if task.name not in states and task.__class__.__name__ == "Deploy":
-                status = states.get("release", "pending")
+                status = states.get(f"deploy-{task.app}", states.get("release", "pending"))
             status = status.replace("finished (cache hit)", "cached").replace("finished", "done")
             statuses[task.name] = status
             styles[task.name] = ("red" if status in ("failed", "blocked") else
@@ -75,27 +93,18 @@ def live_flow(pipeline, states, commit=None):
     width = max(width, max((2 * len(value) + 4 for value in outgoing.values()), default=0))
     width += width % 2
     positions, edges = flow_layout(pipeline, width)
-    # Even source columns and odd target columns keep routes from sharing vertical runs.
-    source_ports = {}
-    target_ports = {}
-    for name, children in outgoing.items():
-        children.sort(key=lambda edge: positions[edge[1]])
-        for index, edge in enumerate(children):
-            source_ports[edge] = positions[name][0] + 2 * (index - len(children) // 2)
-    for name, parents in incoming.items():
-        parents.sort(key=lambda edge: positions[edge[0]])
-        for index, edge in enumerate(parents):
-            target_ports[edge] = positions[name][0] + 2 * (index - len(parents) // 2) + 1
-
+    source_ports = {edge: positions[edge[0]][0] for edge in edges}
+    target_ports = {edge: positions[edge[1]][0] for edge in edges}
+    ranks = {task.name: rank for rank, level in enumerate(levels) for task in level}
     gap_rows = {}
     for rank, level in enumerate(levels[:-1]):
         top = positions[level[0].name][1] + 4
-        next_top = positions[levels[rank + 1][0].name][1]
-        touching = [edge for edge in edges
-                    if positions[edge[0]][1] == top - 4 or positions[edge[1]][1] == next_top]
-        for index, edge in enumerate(touching):
+        routed = [edge for edge in edges
+                  if ranks[edge[0]] <= rank < ranks[edge[1]]
+                  and (source_ports[edge] != target_ports[edge]
+                       or ranks[edge[1]] - ranks[edge[0]] > 1)]
+        for index, edge in enumerate(routed):
             gap_rows[edge, rank] = top + index
-    ranks = {task.name: rank for rank, level in enumerate(levels) for task in level}
     lines = {}
     arrows = set()
     trunks = []
@@ -117,12 +126,14 @@ def live_flow(pipeline, states, commit=None):
         sx, tx = source_ports[edge], target_ports[edge]
         sy, ty = positions[parent][1] + 4, positions[child][1] - 1
         first, last = ranks[parent], ranks[child] - 1
-        start_row, end_row = gap_rows[edge, first], gap_rows[edge, last]
-        if first == last:
+        start_row, end_row = gap_rows.get((edge, first), sy), gap_rows.get((edge, last), sy)
+        obstacles = [(x - width // 2, x - width // 2 + width - 1)
+                     for x, y in positions.values() if sy <= y < ty]
+        if sx == tx and not any(left <= sx <= right for left, right in obstacles):
+            points = [(sx, sy), (tx, ty)]
+        elif first == last:
             points = [(sx, sy), (sx, end_row), (tx, end_row), (tx, ty)]
         else:
-            obstacles = [(x - width // 2, x - width // 2 + width - 1)
-                         for x, y in positions.values() if sy <= y < ty]
             candidates = [sx] + [x for left, right in obstacles for x in (left - 2, right + 2)]
             candidates += [max(x for x, y in positions.values()) + width + 2 * index
                            for index in range(len(edges) + 1)]
@@ -144,10 +155,16 @@ def live_flow(pipeline, states, commit=None):
         arrows.add((tx, ty))
 
     glyphs = {1: "│", 2: "─", 4: "│", 8: "─", 5: "│", 10: "─",
-              3: "└", 6: "┌", 9: "┘", 12: "┐"}
-    grid = {point: ("▼" if point in arrows else
-                    "╳" if len(owners) > 1 else glyphs[next(iter(owners.values()))], "dim")
-            for point, owners in lines.items()}
+              3: "└", 6: "┌", 9: "┘", 12: "┐", 7: "├", 13: "┤",
+              11: "┴", 14: "┬", 15: "┼"}
+    grid = {}
+    for point, owners in lines.items():
+        connected = (len({parent for parent, _ in owners}) == 1
+                     or len({child for _, child in owners}) == 1)
+        mask = 0
+        for directions in owners.values():
+            mask |= directions
+        grid[point] = ("▼" if point in arrows else glyphs[mask] if connected else "╳", "dim")
     box_rows = {}
     for name, (center, y) in positions.items():
         left = center - width // 2
@@ -188,19 +205,16 @@ def live_flow(pipeline, states, commit=None):
             output.append("\n")
     else:
         output.append("(no tasks)\n", style="dim")
-    output.append("\nEdges are declared dependencies; ▼ points to the dependent task.", style="dim")
+    output.append("\n▼ dependency · ↗ child pipeline · rows are not barriers", style="dim")
+    if any(value == "╳" for value, _ in grid.values()):
+        output.append("\n╳ crossing, not a join", style="dim")
     return output
 
 
 def render_flow(pipeline, label="pipeline", depth=0):
-    validate(pipeline)
     indent = "  " * depth
     lines = [f"{indent}{label} | pool: {pipeline.pool or 'none'}"]
-    remaining = {task.name: task for task in pipeline.tasks}
-    done = set()
-    stage = 0
-    while remaining:
-        ready = [task for task in remaining.values() if set(task.needs) <= done]
+    for stage, ready in enumerate(flow_levels(pipeline)):
         lines.append(f"{indent}  stage {stage}: " + "   |   ".join(
             f"[{task.name}]" for task in ready))
         for task in ready:
@@ -208,9 +222,6 @@ def render_flow(pipeline, label="pipeline", depth=0):
                 lines.append(f"{indent}    {', '.join(task.needs)} -> {task.name}")
             if isinstance(task, Call):
                 lines.extend(render_flow(task.pipeline, f"call {task.name}", depth + 2).splitlines())
-            del remaining[task.name]
-        done.update(task.name for task in ready)
-        stage += 1
     if not pipeline.tasks:
         lines.append(f"{indent}  (no tasks)")
     return "\n".join(lines)

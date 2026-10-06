@@ -3,9 +3,9 @@ import tempfile
 import threading
 import unittest
 
-from fixture import create_history
-from simulation import Simulation
-from workflow import Build, Call, Deploy, Pipeline, execute_pipeline, validate
+from lib.fixture import create_history
+from lib.simulation import Simulation
+from lib.workflow import Build, Call, Deploy, Pipeline, execute_pipeline, validate
 
 
 starter_pipeline = Pipeline(
@@ -14,7 +14,15 @@ starter_pipeline = Pipeline(
         Build("zorch"),
         Build("greeb"),
         Build("blerg", needs=["greeb"]),
-        Deploy("release", needs=["zorch", "greeb", "blerg"]),
+        Call("deploy-zorch", needs=["zorch"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-zorch", "zorch")],
+        )),
+        Call("deploy-greeb", needs=["greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-greeb", "greeb")],
+        )),
+        Call("deploy-blerg", needs=["blerg", "deploy-greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-blerg", "blerg")],
+        )),
     ],
 )
 
@@ -35,13 +43,14 @@ class WorkflowTests(unittest.TestCase):
                 gate.wait()
         self.sim.observer = observer
         execute_pipeline(self.sim, starter_pipeline, self.commits)
-        releases = [e["revision"] for e in self.sim.events() if e["kind"] == "deploy_finished"]
+        releases = [e["revision"] for e in self.sim.events() if e["kind"] == "pipeline_finished"
+                    and e["pool"] == "pipeline"]
         self.assertEqual(releases, self.commits)
 
     def test_calls_pass_commit_artifacts_and_wait_for_child(self):
         child = Pipeline(pool="child", tasks=[Build("greeb")])
         parent = Pipeline(pool="parent", tasks=[Call("component", pipeline=child),
-            Deploy("inspect-inputs", needs=["component"],
+            Deploy("inspect-inputs", "greeb", needs=["component"],
                    when=lambda sim, commit, inputs: self.check_inputs(commit, inputs))])
         execute_pipeline(self.sim, parent, self.commits[:1])
         events = self.sim.events()
@@ -63,10 +72,11 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "commit pipeline"):
             execute_pipeline(self.sim, starter_pipeline, self.commits)
         blocked = {e["task"] for e in self.sim.events() if e["kind"] == "task_blocked"}
-        self.assertEqual(blocked, {"blerg", "release"})
-        self.assertFalse(any(e["kind"] == "deploy_started" and e["revision"] == self.commits[0]
+        self.assertEqual(blocked, {"blerg", "deploy-greeb", "deploy-blerg"})
+        self.assertFalse(any(e["kind"] == "deploy_started" and e.get("app") == "greeb"
+                             and e["revision"] == self.commits[0]
                              for e in self.sim.events()))
-        self.assertTrue(any(e["kind"] == "deploy_finished" and e["revision"] == self.commits[-1]
+        self.assertTrue(any(e["kind"] == "deploy_finished" and e["revision"] == self.commits[1]
                             for e in self.sim.events()))
 
     def test_child_failure_propagates_and_pool_is_released(self):
@@ -85,23 +95,20 @@ class WorkflowTests(unittest.TestCase):
             return False
         declaration = Pipeline(tasks=[Build("zorch"), Build("greeb"),
             Build("blerg", needs=["greeb"]),
-            Deploy("release", needs=["zorch", "greeb", "blerg"], when=condition)])
+            Deploy("release", "zorch", needs=["zorch", "greeb", "blerg"], when=condition)])
         execute_pipeline(self.sim, declaration, self.commits[:1])
         self.assertEqual(observed, [(self.commits[0], {"zorch", "greeb", "blerg"})])
         self.assertTrue(any(e["kind"] == "task_skipped" for e in self.sim.events()))
-        self.assertFalse((self.sim.state / "release.json").exists())
+        self.assertFalse((self.sim.state / "deployments").exists())
 
     def test_deploy_mechanics_do_not_secretly_serialize(self):
-        execute_pipeline(self.sim, starter_pipeline, self.commits[:1])
         commit = self.commits[0]
-        import json
-        artifacts = {app: json.loads(self.sim.artifact_path(commit, app).read_text())
-                     for app in ("zorch", "greeb", "blerg")}
+        artifact = self.sim.build(commit, "zorch")
         gate = threading.Barrier(2, timeout=3)
         self.sim.observer = lambda e: gate.wait() if e["kind"] == "deploy_started" else None
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as workers:
-            jobs = [workers.submit(self.sim.deploy, commit, artifacts) for _ in range(2)]
+            jobs = [workers.submit(self.sim.deploy, commit, "zorch", artifact) for _ in range(2)]
             for job in jobs:
                 job.result()
 

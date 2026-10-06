@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -29,7 +30,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout.splitlines(), [
             str(Path(self.directory.name).resolve()), "-B",
-            str(self.root / "exercise.py"), "--plain", "--directory",
+            "-m", "lib.exercise", "--plain", "--directory",
             "results with spaces",
         ])
         self.assertEqual(result.stderr, "")
@@ -41,9 +42,60 @@ class LauncherTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
-        self.assertIn("python3 -m venv .venv", result.stderr)
-        self.assertIn(".venv/bin/python -m pip install -r requirements.txt", result.stderr)
+        self.assertIn(f"Run {self.root}/install first.", result.stderr)
         self.assertFalse((self.root / ".venv").exists())
+
+
+class SetupScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name) / "checkout with spaces"
+        self.root.mkdir()
+        for name in ("install", "run-tests"):
+            shutil.copy2(ROOT / name, self.root / name)
+        self.python = self.root / ".venv/bin/python"
+        self.python.parent.mkdir(parents=True)
+        self.python.write_text('#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\nexit 7\n')
+        self.python.chmod(0o755)
+
+    def test_install_uses_checkout_paths_and_propagates_pip_failure(self):
+        python3 = self.root / "python3"
+        python3.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        python3.chmod(0o755)
+        result = subprocess.run(
+            [str(self.root / "install")], cwd=self.directory.name,
+            env={**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}"},
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout.splitlines(), [
+            "-m", "venv", str(self.root / ".venv"),
+            str(Path(self.directory.name).resolve()),
+            "-m", "pip", "install", "-r", str(self.root / "requirements.txt"),
+        ])
+
+    def test_run_tests_uses_checkout_and_forwards_arguments(self):
+        result = subprocess.run(
+            [str(self.root / "run-tests"), "-p", "test_launcher.py"],
+            cwd=self.directory.name, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 7)
+        lines = result.stdout.splitlines()
+        self.assertEqual(Path(lines[0]).resolve(), self.root.resolve())
+        self.assertEqual(lines[1:], [
+            "-B", "-m", "unittest", "discover",
+            "-s", "tests", "-v", "-p", "test_launcher.py",
+        ])
+
+    def test_run_tests_requires_install(self):
+        self.python.unlink()
+        result = subprocess.run(
+            [str(self.root / "run-tests")], cwd=self.directory.name,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"Run {self.root}/install first.", result.stderr)
 
 
 if __name__ == "__main__":

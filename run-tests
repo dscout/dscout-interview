@@ -9,5 +9,5 @@ if [ ! -x "$python" ]; then
     exit 2
 fi
 
-export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
-exec "$python" -B -m lib.exercise "$@"
+cd "$root"
+exec "$python" -B -m unittest discover -s tests -v "$@"

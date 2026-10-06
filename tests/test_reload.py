@@ -8,11 +8,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import exercise
-from fixture import git
+from lib import exercise
+from lib.fixture import git
 
 
-DECLARATION = '''from workflow import Build, Pipeline
+DECLARATION = '''from lib.workflow import Build, Pipeline
 pipeline = Pipeline(pool="{pool}", tasks=[Build("zorch")])
 '''
 
@@ -25,7 +25,7 @@ class ReloadTests(unittest.TestCase):
         self.path = self.root / "pipeline.py"
         self.directory = self.root / "fixture"
         self.write_pipeline("first")
-        location = patch("exercise.PIPELINE_PATH", self.path)
+        location = patch("lib.exercise.PIPELINE_PATH", self.path)
         location.start()
         self.addCleanup(location.stop)
         previous = sys.modules.get("pipeline")
@@ -80,7 +80,7 @@ class ReloadTests(unittest.TestCase):
         self.path.write_text('''from dataclasses import dataclass
 from pathlib import Path
 import sys
-from workflow import Pipeline
+from lib.workflow import Pipeline
 assert __name__ == "pipeline"
 assert sys.modules[__name__].__dict__ is globals()
 assert Path(__file__).name == "pipeline.py"
@@ -104,7 +104,7 @@ pipeline = Pipeline(pool=Marker(Path(__file__).parent.name).name)
         previous_module = sys.modules["pipeline"]
         for source, error in (("pipeline = (\n", SyntaxError),
                               ("raise RuntimeError('broken')\n", RuntimeError),
-                              ("from workflow import Pipeline, Build\n"
+                              ("from lib.workflow import Pipeline, Build\n"
                                "pipeline = Pipeline(tasks=[Build('unknown')])\n", ValueError)):
             with self.subTest(source=source):
                 self.path.write_text(source)
@@ -148,12 +148,15 @@ pipeline = Pipeline(pool=Marker(Path(__file__).parent.name).name)
         self.assertTrue(builds[-1]["cache_hit"])
 
     def test_import_driver_does_not_evaluate_declaration(self):
-        driver = self.root / "exercise.py"
-        driver.write_bytes(Path(exercise.__file__).read_bytes())
+        package = self.root / "lib"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        for name in ("exercise.py", "fixture.py", "simulation.py", "workflow.py"):
+            (package / name).write_bytes(Path(exercise.__file__).with_name(name).read_bytes())
         self.path.write_text("pipeline = (\n")
         result = subprocess.run(
-            [sys.executable, "-B", "-c", "import exercise; print('ready')"],
-            cwd=self.root, env={**os.environ, "PYTHONPATH": str(Path(exercise.__file__).parent)},
+            [sys.executable, "-B", "-c", "from lib import exercise; print('ready')"],
+            cwd=self.root, env={**os.environ, "PYTHONPATH": str(self.root)},
             capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

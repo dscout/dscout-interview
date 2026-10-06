@@ -11,15 +11,15 @@ Work from your fork or a copy of this repo on the
 `devops-challenge/build-concurrency` branch. From the checkout's root, run:
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+./install
+./run-tests
 ./run
-.venv/bin/python -B -m unittest discover -s tests -v
 ```
 
 Dependencies stay inside `.venv/`, not your global Python installation. No
-activation is needed; delete `.venv/` to remove them. `./run` uses the checkout's
-virtualenv and forwards arguments to `exercise.py`.
+activation is needed; delete `.venv/` to remove them. `./install` can be rerun
+to update dependencies. `./run-tests` runs the test suite. `./run` uses the checkout's
+virtualenv and forwards arguments to `lib/exercise.py`.
 
 The UI opens with a welcome dialog; nothing runs until you choose.
 **Run example (3 PRs)** submits the supplied three-PR scenario, or **Choose PR changes**
@@ -32,7 +32,7 @@ and copy shortcut to copy log output; you may need to hold Shift (or your termin
 mouse-bypass modifier) while dragging. The log is read-only; selecting text within
 the log pauses its auto-scroll. After a run, press
 **r** to rerun the last batch, **n** to choose new simulated changes, or **q**
-to quit. These controls are available after the current run finishes.
+to quit (Ctrl+C also quits). These controls are available after the current run finishes.
 
 In **New simulated PRs**, check a box to simulate Git changes for that app in the
 monorepo. The checked apps change together in one simulated merged PR. **Queue PR**
@@ -65,8 +65,13 @@ For agents, scripts, or a noninteractive terminal, use plain output:
 ## The task
 
 This little monorepo has three apps: `zorch`, `greeb`, and `blerg`.
-`blerg` depends on `greeb`. Each merged PR needs all three built, though unchanged
-inputs can reuse cached builds. The results go into a simulated release.
+`blerg` depends on `greeb`: its build needs that PR's `greeb` artifact, and its
+rollout waits for `greeb` to deploy successfully or skip because it is already
+live. `zorch` is independent. Each merged PR needs all three built, though unchanged
+inputs can reuse cached builds. Each app deploys separately; there is no atomic
+all-app release. Apps whose expected image is already deployed skip their rollout.
+A cache hit alone does not mean an app is deployed. A successful rollout remains
+live if another app fails, so the environment can contain mixed PR versions.
 
 `pipeline.py` declares the build steps and their dependencies. The driver submits
 PR tip commit IDs to that pipeline, like merged PRs arriving at CI. Independent
@@ -109,7 +114,7 @@ RUN_DIR="$(mktemp -d)"
 ./run --directory "$RUN_DIR"
 git -C "$RUN_DIR/repo" log --oneline --stat
 # Use the release path shown in the UI event log:
-python3 -m json.tool "$RUN_DIR/runs/<run-id>/release.json"
+python3 -m json.tool "$RUN_DIR/runs/<run-id>/deployments/zorch.json"
 ```
 
 Run again with the same `--directory` to reuse the Git history. Each UI run keeps
@@ -118,7 +123,7 @@ Plain mode uses `state/` and retains its cache across invocations.
 Remove the directory when you're done: `rm -rf "$RUN_DIR"`.
 
 At the default delay multiplier (`--speed 5`), uncached builds take 1.5 seconds
-for `zorch` and 3 seconds each for `greeb` and `blerg`; a release takes 1 second.
+for `zorch` and 3 seconds each for `greeb` and `blerg`; each app rollout takes 1 second.
 Use `--speed 1` for a quicker run or a larger number to slow things down further.
 `--speed 0` removes delays for quick checks, but doesn't prove concurrency correctness.
 
@@ -137,24 +142,27 @@ lists, not braces (which create sets). These checks don't verify concurrency.
 ## Where to work
 
 - `pipeline.py`: the candidate-editable declaration, exported as `pipeline`.
-- `workflow.py`: the supplied DAG executor and pipeline-pool mechanics.
-- `simulation.py`: builds, caching, artifacts, events, and simulated releases.
-- `fixture.py`: creates the disposable Git history and simulated source changes.
-- `exercise.py`: the command-line driver.
-- `tui.py`: the live display; it observes the same pipeline, without changing its behavior.
+- `lib/workflow.py`: the supplied DAG executor and pipeline-pool mechanics.
+- `lib/simulation.py`: builds, caching, artifacts, events, and simulated releases.
+- `lib/fixture.py`: creates the disposable Git history and simulated source changes.
+- `lib/exercise.py`: the command-line driver.
+- `lib/tui.py`: the live display; it observes the same pipeline, without changing its behavior.
+- `lib/flow.py`: pipeline graph layout and rendering.
 - `tests/`: the existing tests.
 
 ### Declaring a pipeline
 
-Use the Python declarations in `workflow.py`; no YAML or scheduler code is needed:
+Use the Python declarations in `lib/workflow.py`; no YAML or scheduler code is needed:
 
 - `Pipeline(tasks=[...], pool=None)`: runs once per submitted PR tip commit. A named
   pool has capacity one and covers the whole invocation. No pool means no
   pipeline-level concurrency limit.
 - `Build("app", needs=[...])`: builds an app after its dependencies succeed.
   `Build("blerg", needs=["greeb"])` receives that commit's `greeb` artifact.
-- `Deploy("name", needs=[...])`: releases the artifacts from its dependencies
-  and any inputs supplied by a calling pipeline.
+- `Deploy("name", "app", needs=[...])`: deploys one app using its artifact
+  from dependencies or inputs supplied by a calling pipeline. An already-deployed
+  expected image skips the rollout. Deployment dependencies can order rollouts;
+  they do not make them atomic.
 - `Call("name", pipeline=another_pipeline, needs=[...])`: calls a pipeline with
   the same commit ID and artifacts from its dependencies. The call waits for
   the child to finish; the child acquires its own pool, if declared.
@@ -179,7 +187,7 @@ pool, if any. Returning false skips that deployment; raising fails the task.
 Callbacks and helper modules can live alongside your declaration. The executor does
 not supply a release policy for you.
 
-The simulation validates artifacts and atomically writes release state, but does
+The simulation validates artifacts and atomically writes each app's state, but does
 not itself serialize deployments. Your pipeline's concurrency boundaries control
 that behavior. Atomic writes aren't the same as one deployment at a time.
 
@@ -187,10 +195,12 @@ that behavior. Atomic writes aren't the same as one deployment at a time.
 
 - `sim.build(revision, app, dependency=None)` returns an artifact. When building
   `blerg`, pass that revision's `greeb` artifact as the dependency.
-- `sim.deploy(revision, artifacts, image_reference="tag")` takes valid artifacts
-  for all three apps. It resolves their published images and atomically updates
-  the shared release state. `image_reference` accepts `"tag"` or `"digest"`;
+- `sim.deploy(revision, app, artifact, image_reference="tag")` takes one valid
+  app artifact. If its expected image is already deployed, it logs `deploy_skipped`
+  without rolling out. Otherwise it resolves the published image and updates only
+  that app's state on success. `image_reference` accepts `"tag"` or `"digest"`;
   the same option is available on `Deploy` declarations.
+- `sim.deployed(app)` returns that app's deployed record, or `None`.
 - `sim.image_tag(revision, app)` returns the app's source-content tag;
   `sim.image_digest(revision, app)` returns its expected image content digest.
 - `sim.resolve_image(revision, app, reference="tag")` reads a published image.
@@ -207,7 +217,8 @@ Builds also publish images to a local file-backed registry, including on cache
 hits. `blerg` incorporates `greeb`'s manifest. Image digests identify their contents;
 tags use the app's own source content and point to the most recently published
 image under that name. Deployment resolves image references after it starts.
-Release output records both the expected build artifacts and the resolved images.
+Each deployed app's record retains its PR tip, expected artifact, and resolved image.
+Skipped rollouts leave the previous deployed record unchanged.
 
 Exploring image publication and resolution is optional additional work. The
 required take-home goals remain build overlap, deployment exclusion, retained
@@ -225,7 +236,8 @@ In a retained run directory, you'll find the files below. UI results live under
   API and event records call this commit identity `revision`.
 - `state/registry/images/`: image records indexed by immutable content digest.
 - `state/registry/tags/`: published tag pointers.
-- `state/release.json`: the current release, expected artifacts, and resolved images.
+- `state/deployments/<app>.json`: each app's current successful deployment,
+  expected artifact, and resolved image. There is no single environment-wide revision.
 
 ### Test hooks
 
@@ -236,6 +248,8 @@ In a retained run directory, you'll find the files below. UI results live under
   primitives here to control execution in tests.
 - `fail_build(revision, app)`: return `True` to fail a cache miss. The build raises
   an exception without publishing its cache entry.
+- `fail_deploy(revision, app)`: return `True` to fail a rollout before updating
+  deployed state. Already-deployed skips do not invoke this hook.
 
 This is a small simulation, not production CI. It doesn't compile real apps or
 model deployment rollback or recovery from machine crashes.

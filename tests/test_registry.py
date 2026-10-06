@@ -3,8 +3,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from fixture import create_history, git
-from simulation import APPS, Simulation
+from lib.fixture import create_history, git
+from lib.simulation import APPS, Simulation
 
 
 class RegistryTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class RegistryTests(unittest.TestCase):
         return self.sim.state / "registry" / "tags" / f"{tag}.json"
 
     def release(self):
-        return json.loads((self.sim.state / "release.json").read_text())
+        return self.sim.deployed("blerg")
 
     def test_build_publishes_images_and_cache_hits_republish_tags(self):
         revision = self.revisions[0]
@@ -90,29 +90,28 @@ class RegistryTests(unittest.TestCase):
         base, changed, _ = self.revisions
         artifacts = self.build_all(base)
         self.build_all(changed)
-        self.sim.deploy(base, artifacts)
+        self.sim.deploy(base, "blerg", artifacts["blerg"])
         release = self.release()
         expected = self.sim.resolve_image(base, "blerg", "digest")
         actual = self.sim.resolve_image(changed, "blerg", "digest")
-        self.assertEqual(release["artifacts"], artifacts)
-        for app in APPS:
-            self.sim.validate_artifact(base, app, release["artifacts"][app])
+        self.assertEqual(release["artifact"], artifacts["blerg"])
+        self.sim.validate_artifact(base, "blerg", release["artifact"])
         self.assertEqual(release["image_reference"], "tag")
-        self.assertEqual(release["images"]["blerg"], actual)
-        self.assertNotEqual(release["images"]["blerg"], expected)
-        self.assertEqual(release["image_mismatches"], {
-            "blerg": {"expected": expected["digest"], "actual": actual["digest"]},
+        self.assertEqual(release["image"], actual)
+        self.assertNotEqual(release["image"], expected)
+        self.assertEqual(release["image_mismatch"], {
+            "expected": expected["digest"], "actual": actual["digest"],
         })
-        self.sim.deploy(base, artifacts, image_reference="digest")
+        self.sim.deploy(base, "blerg", artifacts["blerg"], image_reference="digest")
         release = self.release()
-        self.assertEqual(release["images"]["blerg"], expected)
+        self.assertEqual(release["image"], expected)
         self.assertEqual(release["image_reference"], "digest")
-        self.assertEqual(release["image_mismatches"], {})
+        self.assertEqual(release["image_mismatch"], {})
         events = [event for event in self.sim.events() if event["kind"].startswith("deploy_")
-                  or event["kind"] == "images_resolved"]
+                  or event["kind"] == "image_resolved"]
         self.assertEqual([event["kind"] for event in events[-4:]],
-                         ["deploy_requested", "deploy_started", "images_resolved", "deploy_finished"])
-        self.assertEqual(events[-2]["images"], release["images"])
+                         ["deploy_requested", "deploy_started", "image_resolved", "deploy_finished"])
+        self.assertEqual(events[-2]["image"], release["image"])
 
     def test_invalid_app_and_reference_are_rejected(self):
         revision = self.revisions[0]
@@ -125,7 +124,7 @@ class RegistryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.sim.resolve_image(revision, "zorch", reference)
                 with self.assertRaises(ValueError):
-                    self.sim.deploy(revision, {}, image_reference=reference)
+                    self.sim.deploy(revision, "zorch", {}, image_reference=reference)
         self.assertEqual(self.sim.events(), [])
 
     def test_missing_and_corrupt_tag_fail_closed(self):
@@ -142,8 +141,8 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(content=content):
                 path.write_text(content)
                 with self.assertRaises(ValueError):
-                    self.sim.deploy(revision, artifacts)
-                self.assertFalse((self.sim.state / "release.json").exists())
+                    self.sim.deploy(revision, "zorch", artifacts["zorch"])
+                self.assertIsNone(self.sim.deployed("zorch"))
         self.assertEqual(self.sim.resolve_image(revision, "zorch", "digest")["digest"],
                          self.sim.image_digest(revision, "zorch"))
 

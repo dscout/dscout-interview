@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 import threading
 
-from simulation import Simulation
+from lib.simulation import Simulation
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,7 @@ class Build:
 @dataclass(frozen=True)
 class Deploy:
     name: str
+    app: str
     needs: Sequence[str] = ()
     when: Callable[[Simulation, str, dict], bool] | None = None
     image_reference: str = "tag"
@@ -78,8 +79,11 @@ def validate(pipeline, ancestors=(), pools=(), pool_edges=None):
                 raise ValueError(f"unknown app: {task.name}")
             if task.name == "blerg" and "greeb" not in task.needs:
                 raise ValueError("blerg must depend on greeb")
-        if isinstance(task, Deploy) and task.image_reference not in ("tag", "digest"):
-            raise ValueError("image_reference must be tag or digest")
+        if isinstance(task, Deploy):
+            if task.app not in ("zorch", "greeb", "blerg"):
+                raise ValueError(f"unknown app: {task.app}")
+            if task.image_reference not in ("tag", "digest"):
+                raise ValueError("image_reference must be tag or digest")
         if isinstance(task, Call):
             validate(task.pipeline, ancestors + (id(pipeline),),
                      pools + ((pipeline.pool,) if pipeline.pool else ()), pool_edges)
@@ -160,9 +164,10 @@ class Executor:
             return {task.name: result}
         if isinstance(task, Deploy):
             if task.when is not None and not task.when(self.sim, commit, artifacts):
-                self.sim.event("task_skipped", commit, task=task.name)
+                self.sim.event("task_skipped", commit, task=task.name, app=task.app)
                 return {}
-            self.sim.deploy(commit, artifacts, image_reference=task.image_reference)
+            self.sim.deploy(commit, task.app, artifacts.get(task.app),
+                            image_reference=task.image_reference)
             return {}
         return self.invoke(task.pipeline, commit, artifacts)
 
@@ -178,7 +183,8 @@ class Executor:
                     if set(task.needs) & failed:
                         failed.add(name)
                         del pending[name]
-                        self.sim.event("task_blocked", commit, task=name)
+                        self.sim.event("task_blocked", commit, task=name,
+                                       **({"app": task.app} if isinstance(task, Deploy) else {}))
                     elif set(task.needs) <= results.keys():
                         artifacts = dict(inputs)
                         for dependency in task.needs:

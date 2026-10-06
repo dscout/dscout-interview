@@ -12,9 +12,9 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Footer, Static, TextArea
 
-from exercise import execute, load_pipeline
-from flow import live_flow
-from simulation import APPS
+from lib.exercise import execute, load_pipeline
+from lib.flow import live_flow
+from lib.simulation import APPS
 
 
 class EventLog(TextArea):
@@ -189,6 +189,7 @@ class BuildApp(App):
         Binding("r", "rerun", "Rerun"),
         Binding("n", "new_changes", "New PRs"),
         Binding("q", "safe_quit", "Quit", priority=True),
+        Binding("ctrl+c", "safe_quit", "Quit", show=False, priority=True),
     ]
 
     def __init__(self, directory: Path, speed: float):
@@ -223,7 +224,8 @@ class BuildApp(App):
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        for column in ("Revision", *APPS, "release", "Duration", "Accum Duration"):
+        for column in ("Revision", *APPS, *(f"deploy-{app}" for app in APPS),
+                       "release", "Duration", "Accum Duration"):
             table.add_column("PR (tip SHA)" if column == "Revision" else column, key=column)
         table.cursor_type = "row"
         self.query_one("#events", EventLog).border_title = "Event log"
@@ -288,8 +290,8 @@ class BuildApp(App):
         self._last_revisions = list(revisions)
         table = self.query_one(DataTable)
         for revision in self._last_revisions:
-            self.states[revision] = dict.fromkeys((*APPS, "release"), "pending")
-            table.add_row(revision[:12], *(Text("pending", style="dim") for _ in range(4)),
+            self.states[revision] = dict.fromkeys((*APPS, *(f"deploy-{app}" for app in APPS), "release"), "pending")
+            table.add_row(revision[:12], *(Text("pending", style="dim") for _ in range(7)),
                           "—", "—", key=revision)
         self._selected_commit = self._last_revisions[0] if self._last_revisions else None
         self._refresh_flow()
@@ -329,9 +331,12 @@ class BuildApp(App):
                 table.update_cell(commit, "Accum Duration",
                                   f"{finish - self._run_event_start:.2f}s", update_width=True)
         column = event.get("app", "release")
+        if kind.startswith("deploy_") and "app" in event:
+            column = f"deploy-{event['app']}"
         if kind in ("task_blocked", "task_skipped"):
             task = event["task"]
-            column = "release" if task == "deploy" else task
+            column = (f"deploy-{event['app']}" if "app" in event
+                      else "release" if task == "deploy" else task)
         status = {
             "build_requested": "waiting (cache lock)",
             "build_started": "building",
@@ -342,6 +347,7 @@ class BuildApp(App):
             "deploy_started": "deploying",
             "deploy_finished": "finished",
             "deploy_failed": "failed",
+            "deploy_skipped": "skipped",
             "task_blocked": "blocked",
             "task_skipped": "skipped",
         }.get(kind)
@@ -353,6 +359,15 @@ class BuildApp(App):
                      "finished (cache hit)": "cached"}.get(status, status)
             self.query_one(DataTable).update_cell(revision, column, Text(label, style=style),
                                                   update_width=True)
+        deployment_states = [self.states[revision][f"deploy-{app}"] for app in APPS]
+        if "app" in event and (kind.startswith("deploy_")
+                               or kind in ("task_skipped", "task_blocked")):
+            summary = ("failed" if any(value in ("failed", "blocked")
+                                      for value in deployment_states) else
+                       "finished" if all(value in ("finished", "skipped")
+                                         for value in deployment_states) else "deploying")
+            self.states[revision]["release"] = summary
+            self.query_one(DataTable).update_cell(revision, "release", summary)
         if revision == self._selected_commit:
             self._refresh_flow()
             terminal = {"finished", "finished (cache hit)", "failed", "blocked", "skipped"}
@@ -384,7 +399,7 @@ class BuildApp(App):
         self.running = False
         self._ended = monotonic()
         if not self.failed:
-            self.query_one(EventLog).write(f"Finished. Release: {self.simulation.state / 'release.json'}")
+            self.query_one(EventLog).write(f"Finished. Deployments: {self.simulation.state / 'deployments'}")
         self._update_status()
 
     def _update_status(self) -> None:

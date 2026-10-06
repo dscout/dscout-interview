@@ -12,10 +12,10 @@ from unittest.mock import Mock, patch
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
-import exercise
-from fixture import create_history, git
-from workflow import Build, Deploy, Pipeline, execute_pipeline
-from simulation import APPS, Simulation
+from lib import exercise
+from lib.fixture import create_history, git
+from lib.workflow import Build, Call, Deploy, Pipeline, execute_pipeline
+from lib.simulation import APPS, Simulation
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,14 +25,22 @@ starter_pipeline = Pipeline(
         Build("zorch"),
         Build("greeb"),
         Build("blerg", needs=["greeb"]),
-        Deploy("release", needs=["zorch", "greeb", "blerg"]),
+        Call("deploy-zorch", needs=["zorch"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-zorch", "zorch")],
+        )),
+        Call("deploy-greeb", needs=["greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-greeb", "greeb")],
+        )),
+        Call("deploy-blerg", needs=["blerg", "deploy-greeb"], pipeline=Pipeline(
+            pool="deployment", tasks=[Deploy("deploy-blerg", "blerg")],
+        )),
     ],
 )
 
 
 class ExerciseTests(unittest.TestCase):
     def setUp(self):
-        pipeline_patch = patch("exercise.load_pipeline", return_value=starter_pipeline)
+        pipeline_patch = patch("lib.exercise.load_pipeline", return_value=starter_pipeline)
         pipeline_patch.start()
         self.addCleanup(pipeline_patch.stop)
         self.directory = tempfile.TemporaryDirectory()
@@ -62,10 +70,10 @@ class ExerciseTests(unittest.TestCase):
                       if e["revision"] == revision and e["kind"] == "build_finished"]
             self.assertEqual({e["app"] for e in events}, set(APPS))
             self.assertEqual({e["app"] for e in events if e["cache_hit"]}, hits)
-            release = json.loads((self.sim.state / "release.json").read_text())
-            self.assertEqual(release["revision"], revision)
             for app in APPS:
-                self.sim.validate_artifact(revision, app, release["artifacts"][app])
+                deployed = self.sim.deployed(app)
+                self.assertEqual(deployed["image"]["digest"], self.sim.image_digest(revision, app))
+                self.sim.validate_artifact(deployed["revision"], app, deployed["artifact"])
         base, greeb, zorch = self.revisions
         self.assertNotEqual(self.sim.cache_key(base, "blerg"),
                             self.sim.cache_key(greeb, "blerg"))
@@ -99,7 +107,7 @@ class ExerciseTests(unittest.TestCase):
     def test_failed_build_does_not_publish_or_release(self):
         base, revision, _ = self.revisions
         execute_pipeline(self.sim, starter_pipeline, [base])
-        release = (self.sim.state / "release.json").read_bytes()
+        release = {app: self.sim.deployed(app) for app in APPS}
         failing = Simulation(self.repo, self.sim.state, speed=0,
                              fail_build=lambda rev, app: app == "greeb")
         with self.assertRaises(RuntimeError):
@@ -110,13 +118,12 @@ class ExerciseTests(unittest.TestCase):
         events = failing.events()
         blocked = {event["task"] for event in events
                    if event["revision"] == revision and event["kind"] == "task_blocked"}
-        self.assertEqual(blocked, {"blerg", "release"})
+        self.assertEqual(blocked, {"blerg", "deploy-greeb", "deploy-blerg"})
         self.assertTrue(any(event["revision"] == revision and event["kind"] == "pipeline_failed"
                             for event in events))
-        self.assertEqual((self.sim.state / "release.json").read_bytes(), release)
+        self.assertEqual({app: self.sim.deployed(app) for app in APPS}, release)
         execute_pipeline(self.sim, starter_pipeline, [revision])
-        self.assertEqual(json.loads((self.sim.state / "release.json").read_text())
-                         ["revision"], revision)
+        self.assertEqual(self.sim.deployed("greeb")["revision"], revision)
 
     def test_dependency_and_release_validation(self):
         base, other, _ = self.revisions
@@ -126,10 +133,10 @@ class ExerciseTests(unittest.TestCase):
         for app in APPS:
             artifacts[app] = self.sim.build(base, app, artifacts.get("greeb"))
         with self.assertRaises(ValueError):
-            self.sim.deploy(other, artifacts)
+            self.sim.deploy(other, "zorch", artifacts["zorch"])
         with self.assertRaises(ValueError):
-            self.sim.deploy(base, {"zorch": artifacts["zorch"]})
-        self.assertFalse((self.sim.state / "release.json").exists())
+            self.sim.deploy(base, "greeb", artifacts["zorch"])
+        self.assertFalse((self.sim.state / "deployments").exists())
 
     def test_concurrent_cache_publication(self):
         revision = self.revisions[0]
@@ -178,7 +185,7 @@ class ExerciseTests(unittest.TestCase):
             events.append(event)
 
         output = io.StringIO()
-        with redirect_stdout(output), patch("exercise.execute_pipeline",
+        with redirect_stdout(output), patch("lib.exercise.execute_pipeline",
                                             wraps=execute_pipeline) as execute:
             sim = exercise.execute(self.root, 0, observer=observe, on_ready=on_ready)
         execute.assert_called_once_with(sim, starter_pipeline, self.revisions)
@@ -190,11 +197,11 @@ class ExerciseTests(unittest.TestCase):
 
     def test_cli_repeated_invocations(self):
         directory = self.root / "cli"
-        command = [sys.executable, "-B", str(ROOT / "exercise.py"),
+        command = [sys.executable, "-B", "-m", "lib.exercise",
                    "--plain", "--directory", str(directory), "--speed", "0"]
         for _ in range(2):
             result = subprocess.run(command, check=True, capture_output=True,
-                                    text=True, cwd=self.root)
+                                    text=True, cwd=ROOT)
             self.assertIn(f"Fixture: {directory.resolve()}", result.stdout)
             history = json.loads((directory / "fixture.json").read_text())["revisions"]
             tips = [line.removeprefix("PR tip: ") for line in result.stdout.splitlines()
@@ -204,16 +211,16 @@ class ExerciseTests(unittest.TestCase):
             self.assertIn("build_finished", result.stdout)
             self.assertIn("pipeline_started", result.stdout)
             self.assertIn("pipeline_finished", result.stdout)
-            self.assertIn(f"Release: {directory.resolve() / 'state/release.json'}", result.stdout)
+            self.assertIn(f"Deployments: {directory.resolve() / 'state/deployments'}", result.stdout)
         events = [json.loads(line) for line in
                   (directory / "state/events.jsonl").read_text().splitlines()]
         builds = [e for e in events if e["kind"] == "build_finished"]
         self.assertEqual(len(builds), 18)
         self.assertTrue(all(e["cache_hit"] for e in builds[-9:]))
-        release = json.loads((directory / "state/release.json").read_text())
         sim = Simulation(directory / "repo", directory / "state", speed=0)
         for app in APPS:
-            sim.validate_artifact(release["revision"], app, release["artifacts"][app])
+            deployed = sim.deployed(app)
+            sim.validate_artifact(deployed["revision"], app, deployed["artifact"])
 
 
 class DriverTests(unittest.TestCase):
@@ -221,13 +228,13 @@ class DriverTests(unittest.TestCase):
         original_import = builtins.__import__
 
         def import_without_ui(name, *args, **kwargs):
-            if name == "tui" or name == "textual" or name.startswith("textual."):
+            if name == "lib.tui" or name == "textual" or name.startswith("textual."):
                 self.fail(f"plain mode imported {name}")
             return original_import(name, *args, **kwargs)
 
         with patch("sys.argv", ["exercise.py", "--plain", "--speed", "0"]), \
                 patch("builtins.__import__", side_effect=import_without_ui), \
-                patch("exercise.execute") as execute:
+                patch("lib.exercise.execute") as execute:
             exercise.main()
         directory, speed = execute.call_args.args
         self.assertEqual(speed, 0)
@@ -245,7 +252,7 @@ class DriverTests(unittest.TestCase):
         app = Mock(failed=False, return_code=0)
         app.run.side_effect = run_app
         app_class = Mock(return_value=app)
-        with patch.dict(sys.modules, {"tui": SimpleNamespace(BuildApp=app_class)}), \
+        with patch.dict(sys.modules, {"lib.tui": SimpleNamespace(BuildApp=app_class)}), \
                 patch("sys.argv", ["exercise.py", "--speed", "0"]):
             exercise.main()
         app.run.assert_called_once_with()
@@ -255,7 +262,7 @@ class DriverTests(unittest.TestCase):
         for failed, return_code in ((True, 0), (False, 1)):
             with self.subTest(failed=failed, return_code=return_code):
                 app = Mock(failed=failed, return_code=return_code)
-                with patch.dict(sys.modules, {"tui": SimpleNamespace(BuildApp=Mock(return_value=app))}), \
+                with patch.dict(sys.modules, {"lib.tui": SimpleNamespace(BuildApp=Mock(return_value=app))}), \
                         patch("sys.argv", ["exercise.py"]), \
                         self.assertRaises(SystemExit) as raised:
                     exercise.main()
@@ -266,7 +273,7 @@ class DriverTests(unittest.TestCase):
         original_import = builtins.__import__
 
         def missing_textual(name, *args, **kwargs):
-            if name == "tui":
+            if name == "lib.tui":
                 raise ModuleNotFoundError("No module named 'textual'", name="textual")
             return original_import(name, *args, **kwargs)
 
@@ -283,7 +290,7 @@ class DriverTests(unittest.TestCase):
         original_import = builtins.__import__
 
         def missing_dependency(name, *args, **kwargs):
-            if name == "tui":
+            if name == "lib.tui":
                 raise ModuleNotFoundError("No module named 'other'", name="other")
             return original_import(name, *args, **kwargs)
 

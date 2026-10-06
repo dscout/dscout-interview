@@ -8,12 +8,12 @@ from pathlib import Path
 import sys
 import tempfile
 
-from fixture import add_changes, create_history, validate_apps
-from workflow import execute_pipeline, validate
-from simulation import Simulation, file_lock
+from lib.fixture import add_changes, create_history, validate_apps
+from lib.workflow import execute_pipeline, validate
+from lib.simulation import Simulation, file_lock
 
 
-PIPELINE_PATH = Path(__file__).with_name("pipeline.py")
+PIPELINE_PATH = Path(__file__).resolve().parents[1] / "pipeline.py"
 
 
 def load_pipeline():
@@ -84,7 +84,7 @@ def execute(directory, speed, *, observer=None, on_ready=None, changes=None,
                      observer=show if observer is None else observer)
     execute_pipeline(sim, pipeline, revisions)
     if observer is None:
-        print(f"Release: {sim.state / 'release.json'}", flush=True)
+        print(f"Deployments: {sim.state / 'deployments'}", flush=True)
     return sim
 
 
@@ -102,14 +102,14 @@ def main():
         launch = execute
     else:
         try:
-            from tui import BuildApp
+            from lib.tui import BuildApp
         except ModuleNotFoundError as error:
             if error.name != "textual" and not (error.name or "").startswith("textual."):
                 raise
             parser.error("Textual is required for the terminal UI. Install locally with "
                          "`python3 -m venv .venv` and "
                          "`.venv/bin/python -m pip install -r requirements.txt`, then run "
-                         "`.venv/bin/python exercise.py`; or use --plain.")
+                         "`./run`; or use --plain.")
 
         def launch(directory, speed):
             app = BuildApp(directory, speed)
