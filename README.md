@@ -1,9 +1,11 @@
-# Interview exercises
+# dscout-interview
 
-## Mobile
+The dscout mobile media upload engine — Kotlin and Swift implementations — with a Node backend harness that plays the part of our API and S3.
 
-- [Partner mobile](../../tree/partner-challenge/mobile)
+**Start here: [AGENTS.md](AGENTS.md)**
 
-## DevOps
+To check your toolchain and run every test suite:
 
-- [Build concurrency](../../tree/devops-challenge/build-concurrency)
+```
+./setup.sh
+```
