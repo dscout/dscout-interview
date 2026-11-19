@@ -10,6 +10,7 @@ Read this file first, then the AGENTS.md in whichever directory you're working i
 backend/   Node/Express upload harness: presign API + fake S3 + fault injection (see backend/AGENTS.md)
 android/   Kotlin upload engine (JVM library; see android/AGENTS.md)
 ios/       Swift upload engine (Swift package; see ios/AGENTS.md)
+requirements/  Product requirements for upcoming work
 ```
 
 `android/` and `ios/` are independent implementations of the same engine — same design, same behavior, each written in its platform's idiom. They are ports of the production code, simplified: no UI, no app host, and the platform background-execution glue (Android foreground service, iOS background tasks) is replaced by a `start()` method the host would call. Media "comes from" a file path.
@@ -40,7 +41,9 @@ The participant's answer is submitted to the server *before* its media finishes 
 
 ## Current state
 
-The engine is ported from production and works on the happy path; the shipped tests cover single-part, multipart, ordering, and a transient S3 error. Its behavior under other failure conditions has not been tested much. The backend harness exists to make those conditions easy to reproduce — see "Fault injection" in `backend/AGENTS.md`.
+The engine is ported from production. The shipped tests cover single-part, multipart, ordering, and a transient S3 error. The backend harness can also inject failures and delays, which is handy for watching how the engine behaves (see "Fault injection" in `backend/AGENTS.md`).
+
+The next planned feature is upload priority, described in `requirements/upload-priority.md`. It isn't implemented: uploads always go one at a time, oldest first.
 
 ## Running everything
 
